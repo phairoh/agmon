@@ -64,10 +64,14 @@ def _blocks(obj: dict) -> list:
 
 def _is_error_event(obj: object) -> bool:
     """True if this event should be flagged as an error at ingest time: a
-    tool_result block with is_error true, or a non-success result event."""
+    tool_result block with is_error true, or a result event that either has a
+    non-success subtype or self-reports is_error true (a subtype may lie —
+    e.g. a 529-overload result stamped subtype:"success", is_error:true)."""
     if not isinstance(obj, dict):
         return False
-    if obj.get("type") == "result" and obj.get("subtype") != "success":
+    if obj.get("type") == "result" and (
+        obj.get("subtype") != "success" or obj.get("is_error") is True
+    ):
         return True
     return any(
         b.get("type") == "tool_result" and b.get("is_error") is True

@@ -161,8 +161,10 @@ def derive_activity(events: list[dict]) -> dict:
         if texts:
             last_text = texts[-1][:200]
 
-    # progress: latest PROGRESS: line across all text, in event order.
+    # progress: latest PROGRESS: line in assistant text, in event order.
     for event in events:
+        if _event_type(event) != "assistant":
+            continue
         for text in _text_blocks(event):
             matches = _PROGRESS_RE.findall(text)
             if matches:
@@ -220,7 +222,7 @@ def derive_issues(events: list[dict]) -> list[dict]:
         if _event_type(event) == "result":
             payload = _payload(event)
             subtype = payload.get("subtype")
-            if subtype != "success":
+            if subtype != "success" or payload.get("is_error") is True:
                 snippet = (_content_to_text(payload.get("result")) or str(subtype))[:200]
                 issues.append(
                     {
