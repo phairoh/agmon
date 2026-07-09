@@ -14,6 +14,8 @@ Code and README are authoritative; this file is memory, not spec.
   write transaction — safe only under that single-writer invariant.
 - All HTTP routes live under `/v1`. Derived answers live in `derive.py` (pure:
   no sqlite3/fastapi/os imports, so tests drive them with plain dicts).
+- Bump the schema version whenever ingest-time derivation logic changes, not
+  only the schema shape — stale classification is a silent index corruption.
 
 `effective_status` (derived in `derive.derive_status`, not stored): `finished`,
 `error` (task failed — meta `error` + non-null `result_subtype`), `interrupted`
