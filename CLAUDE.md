@@ -5,11 +5,23 @@ Code and README are authoritative; this file is memory, not spec.
 - `specs/` holds historical task specs: what was built then, not what is true
   now. Never treat them as current — the code and README win.
 - The spool (`~/agent-runs`, `$AGENT_RUNS_DIR`) is the source of truth; the
-  SQLite DB is a disposable index. Migration = bump schema version, drop DB,
-  replay the spool. Don't hand-edit the DB.
+  SQLite DB is a disposable index. Migration = bump `db.SCHEMA_VERSION`, drop DB,
+  replay the spool. Don't hand-edit the DB. `init_db` enforces this: on a
+  `schema_meta.version` mismatch it deletes the db file + `-wal`/`-shm` sidecars
+  and recreates empty, which resets ingest offsets so the whole spool re-ingests.
 - The ingester thread is the sole writer (scans serialized by a lock); HTTP
   handlers use short-lived read-only connections. `MAX(seq)` is read before the
   write transaction — safe only under that single-writer invariant.
+- All HTTP routes live under `/v1`. Derived answers live in `derive.py` (pure:
+  no sqlite3/fastapi/os imports, so tests drive them with plain dicts).
+
+`effective_status` (derived in `derive.derive_status`, not stored): `finished`,
+`error` (task failed — meta `error` + non-null `result_subtype`), `interrupted`
+(meta `error` + **null** `result_subtype` = stream ended with no result event,
+the retryable kind), `died` (meta `running` but pid gone), `stalled` (meta
+`running`, pid alive, quiet > `AGMON_STALL_SECONDS`), `running`. `events.is_error`
+is set at ingest time (errored tool_result or non-success result event) so issue
+counts are a cheap SQL aggregate; full detail comes from `derive.derive_issues`.
 
 Ingestion (`ingest.py`):
 - Reads spool files in binary mode; `byte_off` is a true byte offset. Never
