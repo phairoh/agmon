@@ -20,8 +20,13 @@ Code and README are authoritative; this file is memory, not spec.
 (meta `error` + **null** `result_subtype` = stream ended with no result event,
 the retryable kind), `died` (meta `running` but pid gone), `stalled` (meta
 `running`, pid alive, quiet > `AGMON_STALL_SECONDS`), `running`. `events.is_error`
-is set at ingest time (errored tool_result or non-success result event) so issue
-counts are a cheap SQL aggregate; full detail comes from `derive.derive_issues`.
+is set at ingest time (errored tool_result, or a result event with a non-success
+subtype **or** `is_error:true` — a subtype can lie, e.g. a 529 stamped
+`subtype:"success"`) so issue counts are a cheap SQL aggregate; full detail comes
+from `derive.derive_issues`. `issue_count` (per-*event* SQL count of `is_error`)
+and the `issues` list (per-*block*, capped at 50) measure different things and may
+legitimately diverge — a line with N errored tool_result blocks adds 1 to
+`issue_count` but N to `issues`; don't assert they're equal.
 
 Ingestion (`ingest.py`):
 - Reads spool files in binary mode; `byte_off` is a true byte offset. Never
