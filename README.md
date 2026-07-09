@@ -46,9 +46,68 @@ All configuration is via environment variables, read once at startup:
 
 ## Running
 
+`agmon` is one installable tool with two faces: a **server** (`agmon serve`)
+and a **CLI client** (everything else). Bare `agmon` / `python -m agmon` is now
+the CLI.
+
 ```sh
-uv sync                 # install deps
-uv run python -m agmon  # start the server (also: `uv run agmon`)
+uv sync            # install deps
+uv run agmon serve # start the collector + API (box-side)
+uv run agmon ls    # query it from the CLI
+```
+
+> **⚠ Upgrading from an earlier version — systemd unit change required.**
+> The server used to start with `python -m agmon`; that command is now the CLI.
+> Change your unit's `ExecStart` to `agmon serve` and reload:
+> ```sh
+> systemctl --user daemon-reload && systemctl --user restart agmon
+> ```
+> A ready-to-copy user unit lives at [`deploy/agmon.service`](deploy/agmon.service).
+
+## CLI
+
+The `agmon` client curates the API into default views with escape hatches.
+`serve` and `run` execute **box-side** (they touch the local spool/process);
+the read commands (`ls`/`show`/`tail`/`events`/`costs`) work **from anywhere**
+with `$AGMON_URL` set.
+
+Global behaviour: the server is `--url`, else `$AGMON_URL`, else
+`http://localhost:8400`. Run-id arguments are optional (omitted = the most
+recent run) and match by unique **substring** (`agmon show a3f9`). Output is a
+rich table on a TTY, decoration-free **TSV** when piped (`--plain` forces TSV);
+`--json` dumps the underlying object(s); `--fields a,b,c` projects one-level
+dotted fields (bare `--fields` lists the available names). `agmon --version`
+prints the version.
+
+```sh
+agmon ls                        # fleet glance, newest first (-n N, --all)
+agmon ls --status running       # filter by raw status (also --session <sid>)
+agmon show a3f9                 # one run, digested (--full-prompt, --raw)
+agmon tail                      # live-follow the latest run (--last N)
+agmon events a3f9 --errors-only     # forensics table (--type, --after, -n)
+agmon costs --days 7            # cost/turn rollup (--since/--until)
+agmon serve --port 8400         # start the server (--host/--port override env)
+agmon run @task.md --cwd ~/src/proj    # launch + spool a run, prints run_id
+```
+
+`agmon tail` is scriptable — it exits `0` on a finished run, `1` on error, and
+`3` if the run died — so `agmon tail $id && next-thing` works. Fields are
+discoverable from the tool itself:
+
+```sh
+agmon show --fields             # list the projectable field names, then exit
+agmon show a3f9 --fields status.effective_status,metrics.total_cost_usd
+```
+
+### Client-only install
+
+The read commands need only the client, not the server box. Install the package
+anywhere on your tailnet and point it at the server:
+
+```sh
+uv tool install agmon           # or: pipx install agmon
+export AGMON_URL=http://server-box:8400
+agmon ls
 ```
 
 ## Tests
@@ -164,12 +223,20 @@ src/agmon/
   config.py    # env-var configuration
   db.py        # schema + connection helpers, drop-and-replay migration
   ingest.py    # background scanner (the only writer)
-  derive.py    # pure derivation functions (status/activity/issues/metrics)
+  derive.py    # pure derivation functions (status/activity/issues/metrics/result)
   api.py       # FastAPI app + endpoints
-  __main__.py  # `python -m agmon`
+  client.py    # pure HTTP client + id resolution + lineage (no printing)
+  render.py    # all CLI formatting (tables/TSV/event compaction; no I/O)
+  cli.py       # argument parsing + wiring (agmon ls/show/tail/events/costs/serve/run)
+  runner.py    # `agmon run` — the ported launch/spool wrapper
+  __main__.py  # `python -m agmon` (the CLI)
 tests/
   test_agmon.py        # ingester + core API
   test_adversarial.py  # byte-offset / crash-durability
   test_derive.py       # pure derivation functions
   test_stage2.py       # stage-2 endpoints + replay-as-migration
+  test_stage3_server.py # result_text + healthz move
+  test_client.py       # id resolution + lineage
+  test_render.py       # event compaction + field flattening
+  test_cli.py          # output layering + tail loop + run smoke
 ```

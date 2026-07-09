@@ -47,6 +47,23 @@ Ingestion (`ingest.py`):
 - Spool files are append-only. Truncating/replacing one shorter than the stored
   offset silently stops that run (offset stuck past EOF); this is undetected.
 
+CLI (`cli.py` wires `client.py` + `render.py`; all three are terminal- and
+network-independent so tests inject a stub client, a StringIO writer, and a
+TTY flag):
+- `agmon tail` exit-code contract (scriptable: `agmon tail $id && next`):
+  `finished`→0, `error`/`interrupted`→1, `died`→3. On a result event the code
+  is from its subtype (success→0 else 1); otherwise from the effective_status.
+  `stalled`/`running` are non-terminal and keep polling.
+- Run-id args resolve by unique **substring** (exact full id wins, ambiguous
+  errors listing candidates, omitted → latest); the resolver is pure
+  (`client.resolve`), tested without a server.
+- `--fields` flattens the JSON one level with dots; default columns render
+  times/durations human-relative while `--fields`/`--json` keep raw values.
+- `/healthz` is unversioned (operational, distinct stability contract); the
+  data API stays under `/v1`.
+- `serve` and `run` execute box-side (local spool/process); read commands work
+  from anywhere with `$AGMON_URL` set.
+
 Testing:
 - `sqlite3.Connection` is a C type with no `__dict__`: you cannot assign or
   monkeypatch its methods. Inject failures via a Python seam (wrap the

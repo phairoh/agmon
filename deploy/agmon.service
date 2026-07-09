@@ -1,0 +1,33 @@
+# agmon — systemd user unit (example).
+#
+# Install as a *user* unit so it runs as you, with access to your spool:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/agmon.service ~/.config/systemd/user/agmon.service
+#   # edit ExecStart / WorkingDirectory / Environment to match your box
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agmon
+#
+# NOTE: as of stage 3 the server is `agmon serve`, not `python -m agmon`
+# (which is now the CLI). If you are upgrading an older unit, change the
+# ExecStart line accordingly and `systemctl --user daemon-reload`.
+
+[Unit]
+Description=agmon — remote agent-run monitor (collector + API)
+After=network.target
+
+[Service]
+Type=simple
+# Absolute path to the project's uv-managed venv, or a plain `agmon` on PATH.
+WorkingDirectory=%h/src/agmon
+ExecStart=%h/src/agmon/.venv/bin/agmon serve
+Restart=on-failure
+RestartSec=2
+
+# Configuration is via environment (see the README table). Override as needed:
+Environment=AGENT_RUNS_DIR=%h/agent-runs
+Environment=AGMON_HOST=0.0.0.0
+Environment=AGMON_PORT=8400
+# Environment=AGMON_STALL_SECONDS=300
+
+[Install]
+WantedBy=default.target

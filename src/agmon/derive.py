@@ -14,7 +14,7 @@ where ``payload`` is the parsed raw event (itself carrying "type", "message",
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # effective_status vocabulary (see derive_status): finished, error, interrupted,
 # died, stalled, running.
