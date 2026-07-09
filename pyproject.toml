@@ -7,10 +7,12 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.139.0",
     "uvicorn>=0.51.0",
+    "httpx>=0.28.1",
+    "rich>=13.0.0",
 ]
 
 [project.scripts]
-agmon = "agmon:main"
+agmon = "agmon.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.28,<0.12.0"]

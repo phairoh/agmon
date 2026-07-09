@@ -135,7 +135,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             config.stall_seconds,
         )
 
-    @app.get("/v1/healthz")
+    @app.get("/healthz")
     def healthz():
         with read() as conn:
             n = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
@@ -203,6 +203,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             "activity": derive.derive_activity(events),
             "issues": derive.derive_issues(events),
             "metrics": derive.derive_metrics(run, events, now),
+            "result_text": derive.derive_result_text(events),
         }
 
     @app.get("/v1/runs/{run_id}/events")

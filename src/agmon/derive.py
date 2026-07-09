@@ -236,6 +236,24 @@ def derive_issues(events: list[dict]) -> list[dict]:
     return issues[-50:]
 
 
+# -- result text -------------------------------------------------------------
+
+
+def derive_result_text(events: list[dict]) -> str | None:
+    """The full ``result`` string from the run's result event, or None.
+
+    The last result event wins (a run emits at most one, but be defensive).
+    A list-shaped result is flattened to text; an absent ``result`` -> None.
+    """
+    text = None
+    for event in events:
+        if _event_type(event) == "result":
+            r = _payload(event).get("result")
+            if r is not None:
+                text = _content_to_text(r)
+    return text
+
+
 # -- metrics -----------------------------------------------------------------
 
 

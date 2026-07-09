@@ -78,10 +78,13 @@ status, process liveness, and event recency. The vocabulary:
 | `stalled`     | meta status `running`, pid alive, but no new events for more than `AGMON_STALL_SECONDS`; `stalled_seconds` is set |
 | `running`     | live and recent                                                 |
 
-### `GET /v1/healthz`
+### `GET /healthz`
+
+Unversioned on purpose: health is an operational endpoint with a different
+stability contract than the `/v1` data API.
 
 ```sh
-curl -s localhost:8400/v1/healthz
+curl -s localhost:8400/healthz
 # {"ok":true,"runs_dir":"/home/you/agent-runs","db":"...","last_scan_at":"2026-07-08T...","runs_tracked":3}
 ```
 
@@ -111,13 +114,14 @@ curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
 
 ### `GET /v1/runs/{run_id}/summary`
 
-The full picture for one run: `{run, status, activity, issues, metrics}`.
-`status` is the derived status block above; `activity` is `{last_tool,
-last_text, progress}`; `issues` is the most recent 50 error-flagged
+The full picture for one run: `{run, status, activity, issues, metrics,
+result_text}`. `status` is the derived status block above; `activity` is
+`{last_tool, last_text, progress}`; `issues` is the most recent 50 error-flagged
 tool_results and non-success results (`{seq, category, tool, snippet}`, where
 `category` is `permission` / `tool_error` / `run_error`); `metrics` is
 `{num_events, tool_counts, duration_seconds, num_turns, total_cost_usd,
-usage}`. All events for the run are loaded per request (no caching).
+usage}`; `result_text` is the full `result` string from the run's result event
+(null if absent). All events for the run are loaded per request (no caching).
 
 ```sh
 curl -s localhost:8400/v1/runs/20260708T174951-67a5e8/summary
