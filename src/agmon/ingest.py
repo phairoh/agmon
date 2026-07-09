@@ -55,6 +55,26 @@ def _as_str_or_none(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _blocks(obj: dict) -> list:
+    """Content blocks of a message event, or []."""
+    msg = obj.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def _is_error_event(obj: object) -> bool:
+    """True if this event should be flagged as an error at ingest time: a
+    tool_result block with is_error true, or a non-success result event."""
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("type") == "result" and obj.get("subtype") != "success":
+        return True
+    return any(
+        b.get("type") == "tool_result" and b.get("is_error") is True
+        for b in _blocks(obj)
+    )
+
+
 class Ingester:
     def __init__(self, config: Config):
         self.config = config
@@ -186,14 +206,14 @@ class Ingester:
             try:
                 obj = json.loads(raw)
             except (json.JSONDecodeError, UnicodeDecodeError):
-                rows.append((run_id, seq, "_unparseable", None, text))
+                rows.append((run_id, seq, "_unparseable", None, text, 0))
                 continue
             if isinstance(obj, dict):
                 typ = _as_str_or_none(obj.get("type"))
                 sub = _as_str_or_none(obj.get("subtype"))
             else:
                 typ, sub = None, None
-            rows.append((run_id, seq, typ, sub, text))
+            rows.append((run_id, seq, typ, sub, text, int(_is_error_event(obj))))
 
         ingested_at = now_iso()
         with self.conn:
@@ -203,9 +223,9 @@ class Ingester:
             if rows:
                 self.conn.executemany(
                     "INSERT OR IGNORE INTO events "
-                    "(run_id, seq, ingested_at, type, subtype, payload) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    [(r[0], r[1], ingested_at, r[2], r[3], r[4]) for r in rows],
+                    "(run_id, seq, ingested_at, type, subtype, payload, is_error) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(r[0], r[1], ingested_at, r[2], r[3], r[4], r[5]) for r in rows],
                 )
             self.conn.execute(
                 "INSERT INTO ingest_state (path, run_id, byte_off, meta_mtime) "

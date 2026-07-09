@@ -13,6 +13,7 @@ class Config:
     db_path: Path
     host: str
     port: int
+    stall_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -25,4 +26,11 @@ class Config:
         ).expanduser()
         host = os.environ.get("AGMON_HOST", "0.0.0.0")
         port = int(os.environ.get("AGMON_PORT", "8400"))
-        return cls(runs_dir=runs_dir, db_path=db_path, host=host, port=port)
+        stall_seconds = int(os.environ.get("AGMON_STALL_SECONDS", "300"))
+        return cls(
+            runs_dir=runs_dir,
+            db_path=db_path,
+            host=host,
+            port=port,
+            stall_seconds=stall_seconds,
+        )
