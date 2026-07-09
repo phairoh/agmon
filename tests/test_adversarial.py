@@ -109,26 +109,26 @@ def test_per_file_failure_does_not_abort_scan(setup):
     bad.write_bytes(b'{"type":"system"}\n')
     good.write_bytes(b'{"type":"result"}\n')
 
-    # Make the events insert blow up unexpectedly, but only for the bad run.
-    real_executemany = ingester.conn.executemany
+    # Inject an unexpected failure for one specific file via a Python-level seam
+    # (sqlite3.Connection forbids attribute assignment, so wrap the method).
+    real_ingest_events = ingester._ingest_events
 
-    def failing_executemany(sql, seq_of_params):
-        params = list(seq_of_params)
-        if params and params[0][0] == "aaa-bad":
-            raise sqlite3.OperationalError("injected failure on bad run")
-        return real_executemany(sql, params)
+    def flaky_ingest_events(jsonl_path, states):
+        if jsonl_path == bad:
+            raise RuntimeError("injected failure ingesting the bad file")
+        return real_ingest_events(jsonl_path, states)
 
-    ingester.conn.executemany = failing_executemany  # type: ignore[method-assign]
+    ingester._ingest_events = flaky_ingest_events  # type: ignore[method-assign]
     try:
         ingester.scan()  # must not raise despite the per-file failure
     finally:
-        ingester.conn.executemany = real_executemany  # type: ignore[method-assign]
+        ingester._ingest_events = real_ingest_events  # type: ignore[method-assign]
 
     # The good file ingested fully.
     good_rows = events_of(ingester.conn, "zzz-good")
     assert [r["type"] for r in good_rows] == ["result"]
 
-    # The failing file rolled back: no events, and its offset never advanced.
+    # The failing file never progressed: no events, and its offset never advanced.
     assert events_of(ingester.conn, "aaa-bad") == []
     assert offset_of(ingester.conn, bad) is None
 
@@ -149,7 +149,9 @@ def test_multibyte_utf8_split_across_scans(setup):
     path.write_bytes(first)
     ingester.scan()
     assert events_of(ingester.conn, run_id) == []  # nothing complete yet
-    assert offset_of(ingester.conn, path) == 0  # no bytes consumed
+    # No complete line was consumed, so no ingest_state row exists yet (the
+    # ingester writes an offset only once it commits events).
+    assert offset_of(ingester.conn, path) is None
 
     with path.open("ab") as f:
         f.write(rest)
@@ -166,27 +168,51 @@ def test_multibyte_utf8_split_across_scans(setup):
 # --- F3: offset and events commit atomically (should pass) ------------------
 
 
+class _FailOffsetConn:
+    """Delegating proxy around the writer connection that fails the ingest_state
+    offset write, forcing the surrounding transaction (runs + events + offset)
+    to roll back as a unit.
+
+    A Python-level seam: ``sqlite3.Connection`` is a C type that forbids
+    attribute assignment, so the failure is injected by wrapping the connection
+    the Ingester holds rather than patching a method on the connection itself.
+    """
+
+    def __init__(self, real: sqlite3.Connection):
+        self._real = real
+
+    def execute(self, sql, *args, **kwargs):
+        # Only the offset write, not the `SELECT ... FROM ingest_state` at the
+        # top of a scan.
+        if "INSERT INTO ingest_state" in sql:
+            raise sqlite3.OperationalError("injected failure on offset write")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def executemany(self, sql, *args, **kwargs):
+        return self._real.executemany(sql, *args, **kwargs)
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *exc):
+        return self._real.__exit__(*exc)
+
+
 def test_offset_and_events_commit_atomically(setup):
     runs_dir, _config, ingester, _new = setup
     run_id = "run-atomic"
     path = runs_dir / f"{run_id}.jsonl"
     path.write_bytes(b'{"type":"system"}\n{"type":"result"}\n')
 
-    # Wrap the writer so the ingest_state offset write fails, forcing the
-    # surrounding transaction (runs + events + offset) to roll back as a unit.
-    real_execute = ingester.conn.execute
-
-    def failing_execute(sql, *args, **kwargs):
-        if "ingest_state" in sql:
-            raise sqlite3.OperationalError("injected failure on offset write")
-        return real_execute(sql, *args, **kwargs)
-
-    ingester.conn.execute = failing_execute  # type: ignore[method-assign]
+    # The offset write fails mid-transaction. Per-file failures are contained by
+    # the scan loop (logged, scan continues), so scan() does not itself raise —
+    # what matters is that the transaction rolled back as a unit.
+    real = ingester.conn
+    ingester.conn = _FailOffsetConn(real)  # type: ignore[assignment]
     try:
-        with pytest.raises(sqlite3.OperationalError):
-            ingester.scan()
+        ingester.scan()
     finally:
-        ingester.conn.execute = real_execute  # type: ignore[method-assign]
+        ingester.conn = real
 
     # Nothing partially committed: no events, no run row, no offset row.
     assert events_of(ingester.conn, run_id) == []

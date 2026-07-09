@@ -184,8 +184,8 @@ class Ingester:
             seq += 1
             text = raw.decode("utf-8", errors="replace")
             try:
-                obj = json.loads(text)
-            except json.JSONDecodeError:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 rows.append((run_id, seq, "_unparseable", None, text))
                 continue
             if isinstance(obj, dict):
