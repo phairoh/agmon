@@ -70,7 +70,7 @@ def test_complete_run(env):
     ingester.scan()
 
     # list endpoint
-    r = client.get("/runs")
+    r = client.get("/v1/runs")
     assert r.status_code == 200
     runs = r.json()["runs"]
     assert len(runs) == 1
@@ -86,7 +86,7 @@ def test_complete_run(env):
     assert item["pid_alive"] is None  # not running
 
     # detail endpoint
-    r = client.get(f"/runs/{run_id}")
+    r = client.get(f"/v1/runs/{run_id}")
     assert r.status_code == 200
     detail = r.json()
     assert detail["prompt"] == "say pong"
@@ -94,7 +94,7 @@ def test_complete_run(env):
     assert detail["event_count"] == 3
 
     # events endpoint
-    r = client.get(f"/runs/{run_id}/events")
+    r = client.get(f"/v1/runs/{run_id}/events")
     body = r.json()
     assert [e["seq"] for e in body["events"]] == [1, 2, 3]
     assert body["events"][0]["type"] == "system"
@@ -105,7 +105,7 @@ def test_complete_run(env):
 
 def test_unknown_run_404(env):
     _, client, _ = env
-    r = client.get("/runs/nope")
+    r = client.get("/v1/runs/nope")
     assert r.status_code == 404
     assert r.json()["error"]
 
@@ -119,7 +119,7 @@ def test_partial_trailing_line(env):
     path.write_text(complete + partial)
     ingester.scan()
 
-    r = client.get(f"/runs/{run_id}/events")
+    r = client.get(f"/v1/runs/{run_id}/events")
     events = r.json()["events"]
     assert len(events) == 1  # partial line not ingested
     assert events[0]["seq"] == 1
@@ -129,7 +129,7 @@ def test_partial_trailing_line(env):
         f.write("\n")
     ingester.scan()
 
-    r = client.get(f"/runs/{run_id}/events")
+    r = client.get(f"/v1/runs/{run_id}/events")
     events = r.json()["events"]
     assert len(events) == 2  # exactly one added
     assert [e["seq"] for e in events] == [1, 2]  # contiguous
@@ -153,12 +153,12 @@ def test_append_resume(env):
     ).fetchone()[0]
 
     assert off2 > off1  # offset advanced
-    events = client.get(f"/runs/{run_id}/events").json()["events"]
+    events = client.get(f"/v1/runs/{run_id}/events").json()["events"]
     assert [e["seq"] for e in events] == [1, 2, 3]  # no dupes, contiguous
 
     # a scan with no new bytes is a no-op
     ingester.scan()
-    events = client.get(f"/runs/{run_id}/events").json()["events"]
+    events = client.get(f"/v1/runs/{run_id}/events").json()["events"]
     assert len(events) == 3
 
 
@@ -171,7 +171,7 @@ def test_stub_run_then_meta(env):
     ingester.scan()
 
     # events ingested even though meta.json is absent
-    detail = client.get(f"/runs/{run_id}").json()
+    detail = client.get(f"/v1/runs/{run_id}").json()
     assert detail["run_id"] == run_id
     assert detail["status"] is None  # stub
     assert detail["event_count"] == 1
@@ -179,7 +179,7 @@ def test_stub_run_then_meta(env):
     # meta arrives later and fills the row in
     write_meta(runs_dir, run_id, prompt="hi", status="running", pid=999999999)
     ingester.scan()
-    detail = client.get(f"/runs/{run_id}").json()
+    detail = client.get(f"/v1/runs/{run_id}").json()
     assert detail["prompt"] == "hi"
     assert detail["status"] == "running"
     assert detail["event_count"] == 1  # events untouched
@@ -195,7 +195,7 @@ def test_unparseable_line(env):
         "{not json\n" + jsonl_lines({"type": "result"})
     )
     ingester.scan()
-    events = client.get(f"/runs/{run_id}/events").json()["events"]
+    events = client.get(f"/v1/runs/{run_id}/events").json()["events"]
     assert events[0]["type"] == "_unparseable"
     assert events[0]["payload"] == "{not json"
     assert events[1]["type"] == "result"
@@ -209,21 +209,21 @@ def test_events_pagination(env):
     )
     ingester.scan()
 
-    body = client.get(f"/runs/{run_id}/events?limit=2").json()
+    body = client.get(f"/v1/runs/{run_id}/events?limit=2").json()
     assert [e["seq"] for e in body["events"]] == [1, 2]
     assert body["next_after"] == 2
 
     body = client.get(
-        f"/runs/{run_id}/events?after={body['next_after']}&limit=2"
+        f"/v1/runs/{run_id}/events?after={body['next_after']}&limit=2"
     ).json()
     assert [e["seq"] for e in body["events"]] == [3, 4]
     assert body["next_after"] == 4
 
-    body = client.get(f"/runs/{run_id}/events?after=4").json()
+    body = client.get(f"/v1/runs/{run_id}/events?after=4").json()
     assert [e["seq"] for e in body["events"]] == [5]
     assert body["next_after"] == 5
 
     # exhausted: empty page echoes the requested after
-    body = client.get(f"/runs/{run_id}/events?after=5").json()
+    body = client.get(f"/v1/runs/{run_id}/events?after=5").json()
     assert body["events"] == []
     assert body["next_after"] == 5
