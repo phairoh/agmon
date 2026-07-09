@@ -70,3 +70,25 @@ Testing:
   connection or override an Ingester method), not `conn.execute = ...`.
 - Verify reviewer-reported test results by running the suite; don't trust
   "passes"/"green" claims unrun.
+
+## Run conventions (every dispatched task)
+
+- Commit as you go, in logical units, plain imperative messages. Work
+  that is not committed does not exist. Finish with `git status` clean.
+- On conflict (spec vs code vs tests vs itself): if it blocks the
+  definition of done, stop and ask. Otherwise take the most defensible
+  resolution and record it in DECISIONS.
+- DECISIONS is a section of your final message — never a file in the
+  repo. One entry per judgment call or deviation, with rationale.
+- Regression test before fix: observe it fail, fix, observe it pass.
+  Never weaken a test to make it pass — a wrong-seeming test is a
+  conflict; see above.
+- Any "passes"/"fails" claim you report must come from a command you ran
+  in this session. Label unexecuted beliefs UNVERIFIED.
+- Durable invariants a future run could violate go in this file, tersely.
+  Things enforced by tests do not; the tests are their home.
+- BACKLOG.md items are deferred by policy. Never fix them while on
+  another task — their strict xfails will XPASS and fail the suite.
+- Create no root files beyond README.md, CLAUDE.md, BACKLOG.md.
+  (REVIEW.md exists transiently: written only by review tasks, consumed
+  and deleted by consolidation.)
