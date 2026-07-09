@@ -1,0 +1,23 @@
+[project]
+name = "agmon"
+version = "0.1.0"
+description = "Remote agent-run monitor: ingester + read-only query API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.139.0",
+    "uvicorn>=0.51.0",
+]
+
+[project.scripts]
+agmon = "agmon:main"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
