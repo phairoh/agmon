@@ -1,5 +1,8 @@
-"""Adversarial tests for review findings (stage-3 CLI). Each xfail encodes a
-bug observed in this review; see REVIEW.md for evidence and suggested fixes.
+"""Regression tests for stage-3 CLI review findings.
+
+F1: `agmon tail --plain` must emit no ANSI (colour or bold) on a TTY.
+F3: `to_tsv` must keep every row one physical line even when a cell contains a
+tab/newline/CR.
 """
 
 from __future__ import annotations
@@ -50,7 +53,6 @@ class _TailStub:
                 "metrics": {"total_cost_usd": 0.04, "duration_seconds": 120}}
 
 
-@pytest.mark.xfail(strict=True, reason="F1")
 def test_tail_plain_suppresses_color_on_tty():
     """`agmon tail --plain` (help: "no color") must emit no ANSI on a TTY.
 
@@ -61,7 +63,6 @@ def test_tail_plain_suppresses_color_on_tty():
     assert "\x1b[" not in out.getvalue()
 
 
-@pytest.mark.xfail(strict=True, reason="F3")
 def test_tsv_row_stays_one_line_with_newline_cell():
     """to_tsv promises "a header line then one tab-joined row each"; a cell with
     an embedded newline must not split one row into several output lines."""

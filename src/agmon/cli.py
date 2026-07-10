@@ -337,13 +337,19 @@ def main(
         return 0
 
     tty_resolved = _resolve_tty(out, tty)
+    # `--plain` forces decoration-free output even on a TTY, mirroring how
+    # `_emit_rows` gates the table path — colour is on only when we have a TTY
+    # and the user did not ask for plain.
+    color = tty_resolved and not getattr(args, "plain", False)
     url = getattr(args, "url", None) or os.environ.get("AGMON_URL") or DEFAULT_URL
     ctx = Ctx(
         client=client if client is not None else Client(url),
         out=out,
         err=err,
         tty=tty_resolved,
-        console=Console(file=out, force_terminal=tty_resolved or None, no_color=not tty_resolved),
+        # `--plain` means decoration-free: strip *all* SGR (colour and bold),
+        # so treat the console as non-terminal for styling when colour is off.
+        console=Console(file=out, force_terminal=color, no_color=not color),
         now=now or datetime.now(timezone.utc),
         sleep=sleep or time.sleep,
     )

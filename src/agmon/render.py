@@ -212,11 +212,20 @@ def _cell_renderable(cell):
     return "" if cell is None else str(cell)
 
 
+_TSV_SEP = {ord("\t"): " ", ord("\n"): " ", ord("\r"): " "}
+
+
+def _tsv_cell(cell) -> str:
+    """One TSV field: a tab/newline/CR inside a value would split the row, so
+    map each to a space — every row stays exactly one physical line."""
+    return _cell_text(cell).translate(_TSV_SEP)
+
+
 def to_tsv(headers: list[str], rows: list[list]) -> str:
     """Plain, decoration-free TSV: a header line then one tab-joined row each."""
-    lines = ["\t".join(headers)]
+    lines = ["\t".join(_tsv_cell(h) for h in headers)]
     for row in rows:
-        lines.append("\t".join(_cell_text(c) for c in row))
+        lines.append("\t".join(_tsv_cell(c) for c in row))
     return "\n".join(lines)
 
 
