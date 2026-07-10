@@ -62,10 +62,11 @@ uv run agmon ls    # query it from the CLI
 > ```sh
 > systemctl --user daemon-reload && systemctl --user restart agmon
 > ```
-> A ready-to-copy user unit lives at [`deploy/agmon.service`](deploy/agmon.service).
+> A ready-to-copy user unit lives at [`deploy/agmon.service`](github.com/phairoh/agmon/blob/main/deploy/agmon.service).
 
 ### Security
-no auth because the tailnet is the auth, bind accordingly, never expose 8400 publicly, tailscale serve for HTTPS
+agmon ships without authentication by design — it assumes deployment inside a private tailnet, where network membership is the access control. Bind to a tailnet address or firewall the port; never expose 8400 to the public internet. If you need HTTPS or want to share access beyond your own devices, put tailscale serve in front of it
+
 
 ## CLI
 
