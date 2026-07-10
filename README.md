@@ -3,7 +3,7 @@
 Remote agent-run monitor. A single FastAPI process that:
 
 1. **Ingests** — a background thread scans `$AGENT_RUNS_DIR` every 2 seconds and
-   folds the spool files written by `agmon-run` (`<run_id>.meta.json` and
+   folds the spool files written by `agmon run` (`<run_id>.meta.json` and
    `<run_id>.jsonl`) into a SQLite database.
 2. **Serves** — a read-only HTTP API for querying run state and streaming
    events, meant to be hit from a laptop on the same tailnet.
@@ -64,6 +64,9 @@ uv run agmon ls    # query it from the CLI
 > ```
 > A ready-to-copy user unit lives at [`deploy/agmon.service`](deploy/agmon.service).
 
+### Security
+no auth because the tailnet is the auth, bind accordingly, never expose 8400 publicly, tailscale serve for HTTPS
+
 ## CLI
 
 The `agmon` client curates the API into default views with escape hatches.
@@ -106,6 +109,7 @@ anywhere on your tailnet and point it at the server:
 
 ```sh
 uv tool install agmon           # or: pipx install agmon
+                                # or: uv tool install git+https://github.com/phairoh/agmon
 export AGMON_URL=http://server-box:8400
 agmon ls
 ```
