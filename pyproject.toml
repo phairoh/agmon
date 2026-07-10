@@ -1,8 +1,9 @@
 [project]
 name = "agmon"
-version = "0.1.0"
-description = "Remote agent-run monitor: ingester + read-only query API"
+version = "0.3.0"
+description = "Monitor headless Claude Code runs from anywhere on your tailnet — spool-based ingest, derived run semantics, and a CLI"
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.139.0",
@@ -10,6 +11,9 @@ dependencies = [
     "httpx>=0.28.1",
     "rich>=13.0.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/phairoh/agmon"
 
 [project.scripts]
 agmon = "agmon.cli:main"
