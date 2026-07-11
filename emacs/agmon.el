@@ -29,6 +29,7 @@
 (require 'tabulated-list)
 (require 'let-alist)
 (require 'subr-x)
+(require 'iso8601)
 
 ;;;; Customization
 
@@ -43,6 +44,50 @@ Defaults to the AGMON_URL environment variable, or
 \"http://localhost:8400\" when that is unset."
   :type 'string
   :group 'agmon)
+
+;;;; Faces
+;;
+;; One face per effective status, applied to the Status cell.  They inherit
+;; from standard faces (`success', `error', `warning', `shadow') so they
+;; track whatever theme the operator runs.  The "act now" states -- running,
+;; stalled, error -- are bold so they pop; finished recedes to `shadow'
+;; because a fleet is mostly finished runs and you rarely need to look at
+;; them.  Retune any of these with `M-x customize-group RET agmon'.
+
+(defface agmon-status-running '((t :inherit success :weight bold))
+  "Face for the Status cell of a running run."
+  :group 'agmon)
+
+(defface agmon-status-finished '((t :inherit shadow))
+  "Face for the Status cell of a finished run."
+  :group 'agmon)
+
+(defface agmon-status-error '((t :inherit error :weight bold))
+  "Face for the Status cell of a run whose task failed."
+  :group 'agmon)
+
+(defface agmon-status-died '((t :inherit error))
+  "Face for the Status cell of a run whose wrapper died without finalizing."
+  :group 'agmon)
+
+(defface agmon-status-stalled '((t :inherit warning :weight bold))
+  "Face for the Status cell of a stalled run (alive but quiet)."
+  :group 'agmon)
+
+(defface agmon-status-interrupted '((t :inherit warning))
+  "Face for the Status cell of an interrupted run (the retryable kind)."
+  :group 'agmon)
+
+(defun agmon--status-face (status)
+  "Return the face symbol for effective STATUS, or `default' if unknown."
+  (pcase status
+    ("running" 'agmon-status-running)
+    ("finished" 'agmon-status-finished)
+    ("error" 'agmon-status-error)
+    ("died" 'agmon-status-died)
+    ("stalled" 'agmon-status-stalled)
+    ("interrupted" 'agmon-status-interrupted)
+    (_ 'default)))
 
 ;;;; HTTP transport
 ;;
@@ -105,32 +150,97 @@ are returned unchanged."
         (concat ".../" (string-join (last parts 2) "/"))
       path)))
 
-(defun agmon--format-started (iso)
-  "Render ISO-8601 timestamp ISO compactly as \"MM-DD HH:MM\".
-Returns ISO unchanged if it does not match.  Stage 2 replaces this
-with human-relative ages."
-  (if (and iso (string-match
-                "\\`[0-9]\\{4\\}-\\([0-9]\\{2\\}-[0-9]\\{2\\}\\)T\\([0-9]\\{2\\}:[0-9]\\{2\\}\\)"
-                iso))
-      (concat (match-string 1 iso) " " (match-string 2 iso))
-    (or iso "")))
+(defun agmon--parse-time (iso)
+  "Parse ISO-8601 string ISO to an Emacs time value, or nil on failure."
+  (when (and iso (stringp iso))
+    (ignore-errors (encode-time (iso8601-parse iso)))))
 
-(defun agmon--run-entry (run)
+(defun agmon--format-age (secs)
+  "Render SECS as a compact human age: \"4m\", \"2h13m\", \"3d\".
+SECS is a non-negative integer count of seconds, or nil (rendered as
+the empty string)."
+  (cond
+   ((null secs) "")
+   ((< secs 60) (format "%ds" secs))
+   ((< secs 3600) (format "%dm" (/ secs 60)))
+   ((< secs 86400)
+    (let ((h (/ secs 3600))
+          (m (/ (% secs 3600) 60)))
+      (if (zerop m) (format "%dh" h) (format "%dh%dm" h m))))
+   (t (format "%dd" (/ secs 86400)))))
+
+(defun agmon--format-cost (cost)
+  "Render COST as \"$%.2f\", or the empty string when COST is not a number."
+  (if (numberp cost) (format "$%.2f" cost) ""))
+
+(defun agmon--run-age-seconds (run now)
+  "Return RUN's age in seconds as of NOW, or nil if unknown.
+Age is time-since-started for every run, so the column reads
+consistently and sorts by recency.  NOW is an Emacs time value."
+  (let-alist run
+    (let ((start (agmon--parse-time .started_at)))
+      (when start
+        (max 0 (floor (float-time (time-subtract now start))))))))
+
+(defun agmon--cell-sort-value (cell)
+  "Return the numeric `agmon-sort' text property carried on CELL, or 0.
+CELL is a tabulated-list cell: a (propertized) string, or a
+\(STRING . PROPS) cons."
+  (let ((s (if (consp cell) (car cell) cell)))
+    (or (and (stringp s) (> (length s) 0)
+             (get-text-property 0 'agmon-sort s))
+        0)))
+
+(defun agmon--numeric-sorter (col)
+  "Return a `tabulated-list' sort predicate for column index COL.
+It compares rows by the `agmon-sort' property stashed on that column's
+cell, so numeric columns (age, cost) sort by value rather than by the
+lexicographic order of their rendered text."
+  (lambda (a b)
+    (< (agmon--cell-sort-value (aref (cadr a) col))
+       (agmon--cell-sort-value (aref (cadr b) col)))))
+
+(defun agmon--run-entry (run &optional now)
   "Build a `tabulated-list' entry from RUN, an alist for one run.
 Returns (ID VECTOR): ID is the full run id, carried on the row so
 later stages can recover it with `tabulated-list-get-id'; VECTOR
-holds the column cells for `agmon-list-mode'."
-  (let-alist run
-    (list .run_id
-          (vector (agmon--short-id .run_id)
-                  (or .effective_status "")
-                  (agmon--abbrev-path (or .cwd ""))
-                  (agmon--format-started .started_at)))))
+holds the column cells for `agmon-list-mode'.  NOW is an Emacs time
+value used to compute the age column, defaulting to the current time.
 
-(defun agmon--run-entries (runs)
+The Status, Age, and Cost cells are propertized: Status carries a
+face, Age and Cost carry an invisible `agmon-sort' property holding
+their underlying numeric value for column sorting."
+  (setq now (or now (current-time)))
+  (let-alist run
+    (let* ((status (or .effective_status ""))
+           (start (agmon--parse-time .started_at))
+           (age (agmon--format-age (agmon--run-age-seconds run now)))
+           (cost .total_cost_usd))
+      (list .run_id
+            (vector
+             (agmon--short-id .run_id)
+             (propertize status 'face (agmon--status-face status))
+             (propertize age 'agmon-sort (if start (float-time start) 0))
+             (propertize (agmon--format-cost cost)
+                         'agmon-sort (if (numberp cost) cost 0))
+             (agmon--abbrev-path (or .cwd ""))
+             (agmon--truncate (agmon--oneline (or .prompt_preview "")) 100))))))
+
+(defun agmon--run-entries (runs &optional now)
   "Return a `tabulated-list-entries' value.
-RUNS is a list of run alists."
-  (mapcar #'agmon--run-entry runs))
+RUNS is a list of run alists; NOW is passed to `agmon--run-entry'."
+  (setq now (or now (current-time)))
+  (mapcar (lambda (run) (agmon--run-entry run now)) runs))
+
+(defun agmon--oneline (s)
+  "Collapse each whitespace sequence in S to a single space, trimmed."
+  (string-join (split-string (or s "") "[ \t\n\r]+" t) " "))
+
+(defun agmon--truncate (s width)
+  "Truncate S to WIDTH characters, marking the cut with an ellipsis."
+  (if (and width (> (length s) width))
+      (concat (substring s 0 (max 0 (1- width))) "…")
+    s))
 
 ;;;; Run list mode
 
@@ -138,18 +248,36 @@ RUNS is a list of run alists."
   "Major mode for browsing the agmon run fleet.
 
 \\{agmon-list-mode-map}"
-  ;; Column format: (NAME WIDTH SORTABLE).  A non-nil SORTABLE makes the
-  ;; header clickable to sort by that column.
+  ;; Column format entries are (NAME WIDTH SORT . PROPS).  A SORT of t sorts
+  ;; the rendered text; a function is a custom predicate (used for Age and
+  ;; Cost, which must sort numerically); nil disables sorting.  PROPS like
+  ;; `:right-align' tune the cell.
   (setq tabulated-list-format
-        [("Id" 8 t)
-         ("Status" 12 t)
-         ("Cwd" 26 t)
-         ("Started" 14 t)])
+        (vector '("Id" 8 t)
+                '("Status" 11 t)
+                (list "Age" 6 (agmon--numeric-sorter 2) :right-align t)
+                (list "Cost" 7 (agmon--numeric-sorter 3) :right-align t)
+                '("Cwd" 20 t)
+                '("Task" 44 nil)))
+  ;; Age's sort value is the start time, so newest-first is the natural
+  ;; default; the `t' flips the ascending predicate to descending.
+  (setq tabulated-list-sort-key (cons "Age" t))
   (setq tabulated-list-padding 1)
   ;; `g' (revert-buffer, inherited from `special-mode') calls this hook,
   ;; then reprints from `tabulated-list-entries' -- so refresh is free.
   (add-hook 'tabulated-list-revert-hook #'agmon--list-refresh nil t)
   (tabulated-list-init-header))
+
+(defun agmon-sort-default ()
+  "Restore the default newest-first sort in an agmon list buffer."
+  (interactive)
+  (setq tabulated-list-sort-key (cons "Age" t))
+  (tabulated-list-init-header)
+  (tabulated-list-print t))
+
+;; `o' restores the default sort after a column-header click sends you
+;; elsewhere; plain tabulated-list-mode has no key to undo a sort.
+(keymap-set agmon-list-mode-map "o" #'agmon-sort-default)
 
 (defun agmon--list-refresh ()
   "Re-fetch the run list into `tabulated-list-entries'.
