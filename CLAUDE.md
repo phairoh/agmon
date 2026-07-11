@@ -4,6 +4,14 @@ Code and README are authoritative; this file is memory, not spec.
 
 - `specs/` holds historical task specs: what was built then, not what is true
   now. Never treat them as current — the code and README win.
+- `notes/friction.md` is the shared friction log — rough edges in the API,
+  tooling, or workflow that a client bumps into (operator or agent; the
+  friction is the same either way). Append to it liberally as you hit things;
+  each entry is a candidate future enhancement, not a committed one. It is
+  raw and unprioritized by design — distinct from `BACKLOG.md` (policy-deferred
+  work with strict xfails) and from `specs/` (per-task briefs). Triage and
+  prioritize over time; graduating an item means writing it up properly
+  elsewhere, not leaving it here.
 - The spool (`~/agent-runs`, `$AGENT_RUNS_DIR`) is the source of truth; the
   SQLite DB is a disposable index. Migration = bump `db.SCHEMA_VERSION`, drop DB,
   replay the spool. Don't hand-edit the DB. `init_db` enforces this: on a
