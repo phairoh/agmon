@@ -30,6 +30,7 @@
 (require 'let-alist)
 (require 'subr-x)
 (require 'iso8601)
+(require 'seq)
 
 ;;;; Customization
 
@@ -43,6 +44,17 @@
 Defaults to the AGMON_URL environment variable, or
 \"http://localhost:8400\" when that is unset."
   :type 'string
+  :group 'agmon)
+
+(defcustom agmon-list-columns '(id status cwd age cost task)
+  "Columns shown in the run list, left to right.
+Each symbol names a column defined in `agmon--column-specs'.  This one
+list controls both order and visibility: reorder it to reorder the
+columns, and drop a symbol to hide that column (say, `cost').  After
+changing it, run \\[agmon] to rebuild the list with the new layout.
+
+Available columns: `id', `status', `cwd', `age', `cost', `task'."
+  :type '(repeat symbol)
   :group 'agmon)
 
 ;;;; Faces
@@ -200,37 +212,83 @@ lexicographic order of their rendered text."
     (< (agmon--cell-sort-value (aref (cadr a) col))
        (agmon--cell-sort-value (aref (cadr b) col)))))
 
+(defconst agmon--column-specs
+  '((id     :name "Id"     :width 8  :sort t)
+    (status :name "Status" :width 11 :sort t)
+    (cwd    :name "Cwd"    :width 20 :sort t)
+    (age    :name "Age"    :width 6  :numeric t :right-align t)
+    (cost   :name "Cost"   :width 7  :numeric t :right-align t)
+    (task   :name "Task"   :width 44))
+  "Registry of every run-list column, keyed by symbol.
+Each entry is (KEY :name NAME :width W [:sort t] [:numeric t]
+[:right-align t]).  `agmon-list-columns' selects which of these to
+show and in what order; `agmon--run-cell' renders each KEY's cell.
+A `:numeric' column sorts by a stashed number (see
+`agmon--numeric-sorter') rather than by its rendered text.")
+
+(defun agmon--run-cell (key run now)
+  "Render the cell for column KEY of RUN, as of time NOW.
+Returns a possibly-propertized string.  KEY is one of the keys in
+`agmon--column-specs'.  Status carries a face; the numeric columns
+carry an invisible `agmon-sort' property holding their raw value."
+  (let-alist run
+    (pcase key
+      ('id (agmon--short-id .run_id))
+      ('status (let ((s (or .effective_status "")))
+                 (propertize s 'face (agmon--status-face s))))
+      ('cwd (agmon--abbrev-path (or .cwd "")))
+      ('age (let ((start (agmon--parse-time .started_at)))
+              (propertize (agmon--format-age (agmon--run-age-seconds run now))
+                          'agmon-sort (if start (float-time start) 0))))
+      ('cost (propertize (agmon--format-cost .total_cost_usd)
+                         'agmon-sort (if (numberp .total_cost_usd)
+                                         .total_cost_usd 0)))
+      ('task (agmon--truncate (agmon--oneline (or .prompt_preview "")) 100))
+      (_ ""))))
+
 (defun agmon--run-entry (run &optional now)
   "Build a `tabulated-list' entry from RUN, an alist for one run.
 Returns (ID VECTOR): ID is the full run id, carried on the row so
-later stages can recover it with `tabulated-list-get-id'; VECTOR
-holds the column cells for `agmon-list-mode'.  NOW is an Emacs time
-value used to compute the age column, defaulting to the current time.
-
-The Status, Age, and Cost cells are propertized: Status carries a
-face, Age and Cost carry an invisible `agmon-sort' property holding
-their underlying numeric value for column sorting."
+later stages can recover it with `tabulated-list-get-id'; VECTOR holds
+one cell per column named in `agmon-list-columns', in that order.  NOW
+is an Emacs time value for the age column, defaulting to the current
+time."
   (setq now (or now (current-time)))
-  (let-alist run
-    (let* ((status (or .effective_status ""))
-           (start (agmon--parse-time .started_at))
-           (age (agmon--format-age (agmon--run-age-seconds run now)))
-           (cost .total_cost_usd))
-      (list .run_id
-            (vector
-             (agmon--short-id .run_id)
-             (propertize status 'face (agmon--status-face status))
-             (propertize age 'agmon-sort (if start (float-time start) 0))
-             (propertize (agmon--format-cost cost)
-                         'agmon-sort (if (numberp cost) cost 0))
-             (agmon--abbrev-path (or .cwd ""))
-             (agmon--truncate (agmon--oneline (or .prompt_preview "")) 100))))))
+  (list (alist-get 'run_id run)
+        (vconcat (mapcar (lambda (key) (agmon--run-cell key run now))
+                         agmon-list-columns))))
 
 (defun agmon--run-entries (runs &optional now)
   "Return a `tabulated-list-entries' value.
 RUNS is a list of run alists; NOW is passed to `agmon--run-entry'."
   (setq now (or now (current-time)))
   (mapcar (lambda (run) (agmon--run-entry run now)) runs))
+
+(defun agmon--list-format ()
+  "Build a `tabulated-list-format' vector from `agmon-list-columns'.
+A column's index is its position in that list, so the numeric sorters
+\(which read a cell by index) stay aligned with the entry vectors
+`agmon--run-entry' builds in the same order."
+  (vconcat
+   (seq-map-indexed
+    (lambda (key idx)
+      (let* ((spec (alist-get key agmon--column-specs))
+             (name (plist-get spec :name))
+             (width (plist-get spec :width))
+             (sort (cond ((plist-get spec :numeric) (agmon--numeric-sorter idx))
+                         ((plist-get spec :sort) t)))
+             (base (list name width sort)))
+        (if (plist-get spec :right-align)
+            (append base '(:right-align t))
+          base)))
+    agmon-list-columns)))
+
+(defun agmon--default-sort-key ()
+  "Return the default sort key: newest-first by Age when Age is shown.
+Nil (server order) when the Age column is hidden, since a sort key
+naming an absent column would error at print time."
+  (when (memq 'age agmon-list-columns)
+    (cons "Age" t)))
 
 (defun agmon--oneline (s)
   "Collapse each whitespace sequence in S to a single space, trimmed."
@@ -248,20 +306,13 @@ RUNS is a list of run alists; NOW is passed to `agmon--run-entry'."
   "Major mode for browsing the agmon run fleet.
 
 \\{agmon-list-mode-map}"
-  ;; Column format entries are (NAME WIDTH SORT . PROPS).  A SORT of t sorts
-  ;; the rendered text; a function is a custom predicate (used for Age and
-  ;; Cost, which must sort numerically); nil disables sorting.  PROPS like
-  ;; `:right-align' tune the cell.
-  (setq tabulated-list-format
-        (vector '("Id" 8 t)
-                '("Status" 11 t)
-                (list "Age" 6 (agmon--numeric-sorter 2) :right-align t)
-                (list "Cost" 7 (agmon--numeric-sorter 3) :right-align t)
-                '("Cwd" 20 t)
-                '("Task" 44 nil)))
+  ;; Both the column format and each row's cells are built from the single
+  ;; list `agmon-list-columns' (see `agmon--list-format' / `agmon--run-entry'),
+  ;; so reordering or hiding a column is a one-line edit to that defcustom.
+  (setq tabulated-list-format (agmon--list-format))
   ;; Age's sort value is the start time, so newest-first is the natural
   ;; default; the `t' flips the ascending predicate to descending.
-  (setq tabulated-list-sort-key (cons "Age" t))
+  (setq tabulated-list-sort-key (agmon--default-sort-key))
   (setq tabulated-list-padding 1)
   ;; `g' (revert-buffer, inherited from `special-mode') calls this hook,
   ;; then reprints from `tabulated-list-entries' -- so refresh is free.
@@ -271,7 +322,7 @@ RUNS is a list of run alists; NOW is passed to `agmon--run-entry'."
 (defun agmon-sort-default ()
   "Restore the default newest-first sort in an agmon list buffer."
   (interactive)
-  (setq tabulated-list-sort-key (cons "Age" t))
+  (setq tabulated-list-sort-key (agmon--default-sort-key))
   (tabulated-list-init-header)
   (tabulated-list-print t))
 
