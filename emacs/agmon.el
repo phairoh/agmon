@@ -57,6 +57,14 @@ Available columns: `id', `status', `cwd', `age', `cost', `task'."
   :type '(repeat symbol)
   :group 'agmon)
 
+(defcustom agmon-detail-table-cell-width 36
+  "Maximum rendered width of a Markdown table cell in the detail buffer.
+Cells longer than this are truncated with an ellipsis, so a wide table
+stays aligned and narrow enough to read without soft-wrapping.  Raise it
+for wide frames, lower it for narrow ones."
+  :type 'integer
+  :group 'agmon)
+
 ;;;; Faces
 ;;
 ;; One face per effective status, applied to the Status cell.  They inherit
@@ -101,6 +109,22 @@ Available columns: `id', `status', `cwd', `age', `cost', `task'."
     ("interrupted" 'agmon-status-interrupted)
     (_ 'default)))
 
+;; Detail-buffer faces.  Labels recede; headings and inline code carry
+;; colour by inheriting from theme font-lock faces, so they track the
+;; user's theme rather than hard-coding hues.
+
+(defface agmon-detail-label '((t :inherit shadow))
+  "Face for the aligned field labels in a run detail buffer."
+  :group 'agmon)
+
+(defface agmon-detail-heading '((t :inherit (bold font-lock-keyword-face)))
+  "Face for section headings (Result, Issues) and rendered Markdown headings."
+  :group 'agmon)
+
+(defface agmon-detail-code '((t :inherit font-lock-constant-face))
+  "Face for Markdown inline code spans in rendered result text."
+  :group 'agmon)
+
 ;;;; HTTP transport
 ;;
 ;; Every request in this package goes through `agmon--request'.  Nothing
@@ -138,6 +162,12 @@ Both are optional and passed through to GET /v1/runs."
                (agmon--request (concat "/v1/runs"
                                        (if (string-empty-p query) ""
                                          (concat "?" query)))))))
+
+(defun agmon--summary (run-id)
+  "Fetch the parsed /summary payload for RUN-ID.
+The reply is a nested alist: `run' (the full record), `status',
+`activity', `issues', `metrics', and `result_text'."
+  (agmon--request (format "/v1/runs/%s/summary" run-id)))
 
 ;;;; Pure render layer
 ;;
@@ -300,6 +330,245 @@ naming an absent column would error at print time."
       (concat (substring s 0 (max 0 (1- width))) "…")
     s))
 
+(defun agmon--nonempty (s)
+  "Return S, unless it is nil or empty, in which case nil."
+  (and s (not (string-empty-p s)) s))
+
+(defun agmon--format-when (time)
+  "Format Emacs TIME as an org-style local timestamp with weekday.
+\"2026-07-09 Wed 21:08\".  Returns \"\" when TIME is nil."
+  (if time (format-time-string "%Y-%m-%d %a %H:%M" time) ""))
+
+(defun agmon--format-tool-counts (counts)
+  "Render alist COUNTS, ((TOOL . N)...), as \"Bash 18 · Read 11\".
+Returns the empty string when COUNTS is nil."
+  (string-join
+   (mapcar (lambda (c) (format "%s %s" (car c) (cdr c))) counts)
+   " · "))
+
+(defun agmon--md-inline (line)
+  "Apply inline Markdown faces (code, then bold) to LINE.
+Returns a propertized copy; unmatched text keeps its properties.  We
+strip the delimiters off the whole match rather than lean on capture
+groups, which sidesteps a `replace-regexp-in-string' match-group quirk."
+  (let ((s line))
+    (setq s (replace-regexp-in-string
+             "`[^`]+`"
+             (lambda (m) (propertize (substring m 1 -1) 'face 'agmon-detail-code))
+             s t t))
+    (setq s (replace-regexp-in-string
+             "\\*\\*[^*]+?\\*\\*"
+             (lambda (m) (propertize (substring m 2 -2) 'face 'bold))
+             s t t))
+    s))
+
+(defun agmon--md-cells (line)
+  "Split a Markdown table row LINE into a list of trimmed cell strings.
+Drops the leading and trailing pipe, then splits on the interior ones."
+  (let ((s (string-trim line)))
+    (setq s (replace-regexp-in-string "\\`|" "" s))
+    (setq s (replace-regexp-in-string "|\\'" "" s))
+    (mapcar #'string-trim (split-string s "|"))))
+
+(defun agmon--md-separator-cell-p (cell)
+  "Non-nil if CELL is a table separator cell (dashes with optional colons)."
+  (string-match-p "\\`:?-+:?\\'" cell))
+
+(defun agmon--md-separator-row-p (line)
+  "Non-nil if LINE is a Markdown table header separator, e.g. |---|:--:|.
+Requires a pipe, so a bare \"---\" horizontal rule does not qualify."
+  (and (string-search "|" line)
+       (let ((cells (agmon--md-cells line)))
+         (and cells (seq-every-p #'agmon--md-separator-cell-p cells)))))
+
+(defun agmon--md-pad (cell width)
+  "Right-pad rendered CELL with spaces to display WIDTH."
+  (concat cell (make-string (max 0 (- width (string-width cell))) ?\s)))
+
+(defun agmon--render-table (rows)
+  "Render ROWS, raw Markdown table row strings, to an aligned table string.
+Inline markup is applied to cells; cells wider than
+`agmon-detail-table-cell-width' are truncated.  The header row is drawn
+in the heading face above a rule; columns are separated by \" | \"."
+  (let* ((grid (mapcar
+                (lambda (row)
+                  (mapcar (lambda (c)
+                            (agmon--truncate (agmon--md-inline c)
+                                             agmon-detail-table-cell-width))
+                          (agmon--md-cells row)))
+                (seq-remove #'agmon--md-separator-row-p rows)))
+         (ncols (apply #'max 0 (mapcar #'length grid)))
+         (widths (make-vector ncols 0)))
+    (dolist (row grid)
+      (seq-do-indexed
+       (lambda (cell i) (aset widths i (max (aref widths i) (string-width cell))))
+       row))
+    (let ((line (lambda (cells)
+                  (string-join
+                   (seq-map-indexed
+                    (lambda (cell i) (agmon--md-pad cell (aref widths i)))
+                    cells)
+                   " │ ")))
+          (out nil)
+          (header (car grid)))
+      (when header
+        (let ((h (funcall line header)))
+          (add-face-text-property 0 (length h) 'agmon-detail-heading nil h)
+          (push h out))
+        (push (mapconcat (lambda (w) (make-string w ?─))
+                         (append widths nil) "─┼─")
+              out))
+      (dolist (row (cdr grid))
+        (push (funcall line row) out))
+      (string-join (nreverse out) "\n"))))
+
+(defun agmon--render-markdown (text)
+  "Render Markdown TEXT to a propertized string.
+Handles ATX headings (#...), unordered bullets, pipe tables, inline code
+and bold -- enough to make result_text readable; deliberately not a full
+parser."
+  (let ((lines (split-string text "\n"))
+        (out nil))
+    (while lines
+      (let ((line (car lines)))
+        (cond
+         ;; Table: a pipe row immediately followed by a |---| separator.
+         ((and (cdr lines)
+               (string-search "|" line)
+               (agmon--md-separator-row-p (cadr lines)))
+          (let ((block (list line)))    ; header row
+            (setq lines (cddr lines))     ; skip past header and separator
+            (while (and lines (string-search "|" (car lines)))
+              (push (car lines) block)
+              (setq lines (cdr lines)))
+            ;; BLOCK is header + body rows, in order after `nreverse'.
+            (push (agmon--render-table (nreverse block)) out)))
+         ;; Heading.
+         ((string-match "\\`#+[ \t]+\\(.*\\)\\'" line)
+          (push (propertize (match-string 1 line) 'face 'agmon-detail-heading) out)
+          (setq lines (cdr lines)))
+         ;; Unordered bullet.
+         ((string-match "\\`[ \t]*[-*][ \t]+\\(.*\\)\\'" line)
+          (push (concat "  • " (agmon--md-inline (match-string 1 line))) out)
+          (setq lines (cdr lines)))
+         (t
+          (push (agmon--md-inline line) out)
+          (setq lines (cdr lines))))))
+    (string-join (nreverse out) "\n")))
+
+(defun agmon--detail-field (label value)
+  "Format an aligned LABEL/VALUE row for the detail buffer.
+Returns nil when VALUE is empty, so callers can `delq' it out."
+  (when (agmon--nonempty value)
+    (concat (propertize (format "%-9s" label) 'face 'agmon-detail-label)
+            value)))
+
+(defun agmon--render-summary (summary now show-issues)
+  "Render SUMMARY, a parsed /summary payload, to a display string as of NOW.
+SHOW-ISSUES non-nil expands the per-issue detail; otherwise only the
+Issues heading shows.  Pure: it takes data and returns a propertized
+string, with no network call and no buffer mutation, so ert can diff it
+against a canned payload."
+  (let-alist summary
+    (let* ((status (or .status.effective_status ""))
+           (started (agmon--parse-time .run.started_at))
+           (started-age (and started
+                             (floor (float-time (time-subtract now started)))))
+           (dur (let ((d (or .metrics.duration_seconds
+                             (and started (float-time
+                                           (time-subtract now started))))))
+                  (and d (floor d))))
+           (git (agmon--nonempty
+                 (string-trim
+                  (concat (or .run.git_branch "")
+                          (if .run.git_commit (concat " @ " .run.git_commit) "")))))
+           (started-str
+            (and started
+                 (concat (agmon--format-when started)
+                         (if started-age
+                             (propertize
+                              (format "   ·   %s ago" (agmon--format-age started-age))
+                              'face 'shadow)
+                           ""))))
+           (dur-str (string-join
+                     (delq nil
+                           (list (and dur (agmon--format-age dur))
+                                 (and (numberp .run.exit_code)
+                                      (format "exit %d" .run.exit_code))))
+                     "   ·   "))
+           (cost-str (string-join
+                      (delq nil
+                            (list (agmon--nonempty
+                                   (agmon--format-cost .run.total_cost_usd))
+                                  (and .run.num_turns
+                                       (format "%d turns" .run.num_turns))
+                                  (and .run.event_count
+                                       (format "%d events" .run.event_count))))
+                      "   ·   "))
+           (tools (agmon--format-tool-counts .metrics.tool_counts))
+           (lines nil))
+      ;; Header: a status-coloured dot, the short id, and the status word.
+      (push (concat (propertize "● " 'face (agmon--status-face status))
+                    (propertize (agmon--short-id .run.run_id) 'face 'bold)
+                    "   "
+                    (propertize status 'face (agmon--status-face status)))
+            lines)
+      (push "" lines)
+      ;; Aligned label/value block -- one field per line, labels dimmed.
+      (dolist (field (delq nil
+                           (list (agmon--detail-field "Path" .run.cwd)
+                                 (agmon--detail-field "Git" git)
+                                 (agmon--detail-field "Host" .run.host)
+                                 (agmon--detail-field "Started" started-str)
+                                 (agmon--detail-field "Duration" dur-str)
+                                 (agmon--detail-field "Cost" cost-str)
+                                 (agmon--detail-field "Tools" tools))))
+        (push field lines))
+      ;; Activity: latest progress line and last tool call, same label style.
+      (when (or (agmon--nonempty .activity.progress) .activity.last_tool)
+        (push "" lines))
+      (when (agmon--nonempty .activity.progress)
+        (push (agmon--detail-field "Progress" (agmon--oneline .activity.progress))
+              lines))
+      (when .activity.last_tool
+        (let ((lt .activity.last_tool))
+          (push (agmon--detail-field
+                 "Last"
+                 (concat (or (alist-get 'tool lt) "") "  "
+                         (agmon--truncate
+                          (agmon--oneline (or (alist-get 'target lt) "")) 70)))
+                lines)))
+      ;; Issues, collapsed to the heading unless SHOW-ISSUES (they are
+      ;; usually the routine \"read before edit\" kind, so hide by default).
+      (when .issues
+        (push "" lines)
+        (push (concat (propertize (format "Issues (%d)" (length .issues))
+                                  'face 'agmon-detail-heading)
+                      "   "
+                      (propertize (if show-issues "TAB to hide" "TAB to show")
+                                  'face 'shadow))
+              lines)
+        (when show-issues
+          (dolist (iss .issues)
+            (let ((cat (or (alist-get 'category iss) ""))
+                  (tool (or (alist-get 'tool iss) ""))
+                  (seq (alist-get 'seq iss))
+                  (snip (or (alist-get 'snippet iss) "")))
+              (push (concat "  "
+                            (propertize (format "[%s]" cat)
+                                        'face 'agmon-status-error)
+                            " " tool (if seq (format " @%s" seq) ""))
+                    lines)
+              (push (concat "    " (agmon--truncate (agmon--oneline snip) 90))
+                    lines)))))
+      ;; Result: the final message, Markdown-styled, in full.
+      (push "" lines)
+      (push (propertize "Result" 'face 'agmon-detail-heading) lines)
+      (let ((result (agmon--nonempty (string-trim (or .result_text "")))))
+        (push (if result (agmon--render-markdown result) "(no result yet)")
+              lines))
+      (concat (string-join (nreverse lines) "\n") "\n"))))
+
 ;;;; Run list mode
 
 (define-derived-mode agmon-list-mode tabulated-list-mode "Agmon"
@@ -330,10 +599,114 @@ naming an absent column would error at print time."
 ;; elsewhere; plain tabulated-list-mode has no key to undo a sort.
 (keymap-set agmon-list-mode-map "o" #'agmon-sort-default)
 
+;; `RET' drills into the run at point.  (evil users: this key is only
+;; reachable because agmon-list-mode-map is marked as an overriding map
+;; in the operator's config; see the package README.)
+(keymap-set agmon-list-mode-map "RET" #'agmon-show-run)
+
 (defun agmon--list-refresh ()
   "Re-fetch the run list into `tabulated-list-entries'.
 Installed on `tabulated-list-revert-hook', so `g' refreshes."
   (setq tabulated-list-entries (agmon--run-entries (agmon--runs))))
+
+;;;; Run detail buffer
+;;
+;; RET on a list row opens a read-only buffer describing one run, drawn
+;; from GET /summary.  It derives from `special-mode' -- Emacs's base for
+;; non-editable, command-driven buffers (Help, dired-like views): it makes
+;; the buffer read-only and binds `q' to bury it and `g' to revert.  We
+;; hang our re-fetch on the revert machinery, so `g' refreshes for free,
+;; exactly as the list does.
+
+(defvar-local agmon--detail-run-id nil
+  "Full run id this detail buffer describes.
+Buffer-local: each *agmon: ID* buffer remembers its own run, so `g'
+knows what to re-fetch.")
+
+(defvar-local agmon--detail-summary nil
+  "Cached parsed /summary for this detail buffer.
+`g' refreshes it from the server; the `TAB' issues toggle re-renders
+from this cache without a network round-trip.")
+
+(defvar-local agmon--detail-show-issues nil
+  "Non-nil when this buffer expands the per-issue detail.
+Buffer-local and off by default -- issues are usually routine.  `TAB'
+flips it.")
+
+;; `q' (bury) and `g' (revert) are inherited from `special-mode'; we add
+;; TAB to expand/collapse the issues section.  Bind both spellings: `TAB'
+;; is the terminal form (C-i), `<tab>' the event a graphical frame's Tab
+;; key actually sends -- binding only one leaves the other dead on GUIs.
+(defvar-keymap agmon-detail-mode-map
+  :doc "Keymap for `agmon-detail-mode'."
+  "TAB" #'agmon-detail-toggle-issues
+  "<tab>" #'agmon-detail-toggle-issues)
+
+(define-derived-mode agmon-detail-mode special-mode "Agmon-Detail"
+  "Major mode for a single run's detail view.
+
+\\{agmon-detail-mode-map}"
+  ;; `g' runs `revert-buffer', which delegates to this function; we
+  ;; re-fetch and redraw.  Same pattern as the list's revert hook.
+  (setq-local revert-buffer-function #'agmon--detail-revert)
+  ;; Soft-wrap long prose (the result text) at the window edge on word
+  ;; boundaries, so the operator never has to toggle wrapping by hand.
+  (visual-line-mode 1))
+
+(defun agmon--detail-revert (&rest _)
+  "Re-fetch this buffer's summary from the server and redraw.
+Installed as the buffer-local `revert-buffer-function', so `g' works.
+Ignores its arguments."
+  (agmon--detail-fetch))
+
+(defun agmon--detail-fetch ()
+  "Fetch this buffer's run summary into the cache, then redraw."
+  (setq agmon--detail-summary (agmon--summary agmon--detail-run-id))
+  (agmon--detail-render))
+
+(defun agmon--detail-render ()
+  "Redraw this buffer from its cached summary -- no network.
+`special-mode' keeps the buffer read-only; we lift that with
+`inhibit-read-only' only for our own insert, and try to keep point so a
+`TAB' toggle does not jump the view."
+  (let ((inhibit-read-only t)
+        (p (point)))
+    (erase-buffer)
+    (insert (agmon--render-summary agmon--detail-summary
+                                   (current-time)
+                                   agmon--detail-show-issues))
+    (goto-char (min p (point-max)))))
+
+(defun agmon-detail-toggle-issues ()
+  "Expand or collapse the per-issue detail in this run's detail buffer."
+  (interactive)
+  (setq agmon--detail-show-issues (not agmon--detail-show-issues))
+  (agmon--detail-render))
+
+(defun agmon--open-detail (run-id &optional side)
+  "Open, refresh, and select the detail buffer for RUN-ID.
+With SIDE non-nil, show it in a right-hand side window instead of the
+current one."
+  (let ((buf (get-buffer-create (format "*agmon: %s*" (agmon--short-id run-id)))))
+    (with-current-buffer buf
+      (agmon-detail-mode)
+      (setq agmon--detail-run-id run-id)
+      (agmon--detail-fetch))
+    (if side
+        (select-window
+         (display-buffer buf '((display-buffer-in-side-window)
+                               (side . right)
+                               (window-width . 0.5))))
+      (pop-to-buffer-same-window buf))))
+
+(defun agmon-show-run (&optional run-id side)
+  "Open the detail buffer for RUN-ID, defaulting to the run at point.
+With a prefix argument (interactively, SIDE non-nil), open it in a
+right-hand side window so the list stays visible."
+  (interactive (list nil current-prefix-arg))
+  (let ((id (or run-id (tabulated-list-get-id))))
+    (unless id (user-error "No run at point"))
+    (agmon--open-detail id side)))
 
 ;;;###autoload
 (defun agmon ()
