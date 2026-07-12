@@ -56,7 +56,7 @@ Defaults to the AGMON_URL environment variable, or
   :type 'string
   :group 'agmon)
 
-(defcustom agmon-list-columns '(id status cwd age cost task)
+(defcustom agmon-list-columns '(id status phase cwd age cost task)
   "Columns shown in the run list, left to right.
 Each symbol names a column defined in `agmon--column-specs'.  This one
 list controls both order and visibility: reorder it to reorder the
