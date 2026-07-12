@@ -592,6 +592,29 @@ itself wears the `link' face as an affordance."
                   'help-echo "mouse-1/RET: open this run"
                   'keymap agmon--lineage-map))))
 
+(defun agmon--indent-field (label value)
+  "An indented LABEL/VALUE row for a sub-section heading (Pipeline, Labels)."
+  (concat "  " (propertize (format "%-9s" label) 'face 'agmon-detail-label) value))
+
+(defun agmon--pipeline-ref (label run-id &optional phase status)
+  "Format a clickable pipeline-lineage reference row for RUN-ID.
+LABEL is the relation (parent/child/sibling); PHASE and STATUS annotate a
+sibling.  The row carries RUN-ID as `agmon-run-id' (with the lineage
+mouse map) so `agmon-detail-follow' -- RET or a click -- opens it."
+  (let ((line (concat
+               "  "
+               (propertize (format "%-9s" label) 'face 'agmon-detail-label)
+               (propertize (agmon--short-id run-id) 'face 'link)
+               (if (agmon--nonempty phase) (concat "  " phase) "")
+               (if (agmon--nonempty status)
+                   (concat "  " (propertize status 'face (agmon--status-face status)))
+                 ""))))
+    (propertize line
+                'agmon-run-id run-id
+                'mouse-face 'highlight
+                'help-echo "mouse-1/RET: open this run"
+                'keymap agmon--lineage-map)))
+
 (defun agmon--render-summary (summary now show-issues runs)
   "Render SUMMARY, a parsed /summary payload, to a display string as of NOW.
 SHOW-ISSUES non-nil expands the per-issue detail; otherwise only the
@@ -670,15 +693,50 @@ against a canned payload."
                          (agmon--truncate
                           (agmon--oneline (or (alist-get 'target lt) "")) 70)))
                 lines)))
-      ;; Lineage: other runs sharing this run's session_id (resume chain).
+      ;; Pipeline lineage: the intentional relation from reserved labels
+      ;; (pipeline/phase/parent + derived children/siblings).  Deliberately
+      ;; kept distinct from the session resume chain below -- never conflate.
+      (when .lineage
+        (push "" lines)
+        (push (propertize "Pipeline" 'face 'agmon-detail-heading) lines)
+        (when (agmon--nonempty .lineage.pipeline)
+          (push (agmon--indent-field "pipeline" .lineage.pipeline) lines))
+        (when (agmon--nonempty .lineage.phase)
+          (push (agmon--indent-field "phase" .lineage.phase) lines))
+        (when (agmon--nonempty .lineage.parent)
+          (push (agmon--pipeline-ref "parent" .lineage.parent) lines))
+        (dolist (c .lineage.children)
+          (push (agmon--pipeline-ref "child" c) lines))
+        ;; Siblings already surfaced as parent/child would just repeat.
+        (let ((shown (append (and .lineage.parent (list .lineage.parent))
+                             .lineage.children)))
+          (dolist (s .lineage.siblings)
+            (let ((rid (alist-get 'run_id s)))
+              (unless (member rid shown)
+                (push (agmon--pipeline-ref "sibling" rid
+                                           (alist-get 'phase s)
+                                           (alist-get 'effective_status s))
+                      lines))))))
+      ;; Session lineage: other runs sharing this run's session_id (resumes).
       (let* ((lin (agmon--lineage .run.run_id .run.session_id runs))
              (from (car lin))
              (by (cdr lin)))
         (when (or from by)
           (push "" lines)
-          (push (propertize "Lineage" 'face 'agmon-detail-heading) lines)
+          (push (propertize "Session" 'face 'agmon-detail-heading) lines)
           (dolist (r from) (push (agmon--lineage-line "resumed from" r now) lines))
           (dolist (r by) (push (agmon--lineage-line "resumed by" r now) lines))))
+      ;; Labels: any non-reserved labels, raw (the reserved ones surface
+      ;; above as Pipeline).
+      (let ((other (seq-remove (lambda (kv) (memq (car kv) '(pipeline phase parent)))
+                               .run.labels)))
+        (when other
+          (push "" lines)
+          (push (propertize "Labels" 'face 'agmon-detail-heading) lines)
+          (dolist (kv other)
+            (push (agmon--indent-field (format "%s" (car kv))
+                                       (format "%s" (cdr kv)))
+                  lines))))
       ;; Issues, collapsed to the heading unless SHOW-ISSUES (they are
       ;; usually the routine \"read before edit\" kind, so hide by default).
       (when .issues
@@ -899,10 +957,15 @@ rides on the line as an `agmon-run-id' text property (see
 `agmon--lineage-line'); bound to RET and to a mouse click on a lineage
 line."
   (interactive (list last-nonmenu-event))
-  (let* ((pos (if (mouse-event-p event) (posn-point (event-end event)) (point)))
+  (let* ((win (if (mouse-event-p event) (posn-window (event-end event))
+                (selected-window)))
+         (pos (if (mouse-event-p event) (posn-point (event-end event)) (point)))
          (id (get-text-property pos 'agmon-run-id)))
     (if id
-        (agmon--open-detail id)
+        ;; Reuse the current window: a plain window follows same-window, but a
+        ;; side window is dedicated -- reopen in its side slot so it reuses
+        ;; that window instead of spawning a new one.
+        (agmon--open-detail id (and (window-parameter win 'window-side) t))
       (user-error "No run link at point"))))
 
 (defun agmon--open-detail (run-id &optional side)
