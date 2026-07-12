@@ -30,3 +30,26 @@
   Right fix is server-side: the /v1/runs list gains a last_tool /
   last_target per row (one aggregate query, consistent with the
   event_count subquery pattern) — not N+1 client summary calls.
+- BIG IDEA (institutionalize the dev loop as a first-class lineage):
+  this repo is built by a fixed pipeline — spec -> build -> adversarial
+  review -> consolidate review — but today each phase is a separately,
+  manually dispatched run, related only loosely. `session_id` captures
+  resume chains (same conversation continued), NOT cross-phase links: a
+  build run and its review run are different sessions entirely, so agmon
+  sees them as unrelated. Institutionalize the pipeline: an orchestrator
+  that runs the phases fully agentically end to end, and agmon tracking
+  the whole thing as one coherent *lineage* rather than N disconnected
+  runs. Two halves, keep them separate:
+  1. Represent/navigate (agmon's job): a pipeline/lineage id + a phase
+     label (spec|build|review|consolidate) stamped into run metadata by
+     the orchestrator — `session_id` won't carry it. That is a spool
+     metadata + ingest-derivation change → bump `db.SCHEMA_VERSION` (per
+     CLAUDE.md). The detail-buffer lineage section then badges phases and
+     shows the sibling phases of the same pipeline; distinct from the
+     resume-chain lineage now in agmon.el (this is an intentional phase
+     DAG, not a resume).
+  2. Orchestrate/dispatch (control-plane): actually launching the phase
+     runs and gating between them (build only after spec, review after
+     build, etc.). This is out of scope for the read-only agmon.el mode
+     (spec fences control-plane to stage 4+ / a separate roadmap item) —
+     but it is the half that makes the loop "run fully agentically."
