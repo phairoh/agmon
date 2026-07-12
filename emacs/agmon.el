@@ -33,6 +33,7 @@
 (require 'seq)
 (require 'json)
 (require 'js)
+(require 'treesit)
 (require 'url-util)
 
 ;;;; Internal state
@@ -1124,10 +1125,11 @@ right-hand side window so the list stays visible."
 ;;
 ;; `J' anywhere in agmon shows the run at point's /summary as
 ;; pretty-printed JSON -- the CLI's `--json' reborn as a keybinding, for
-;; when the rendered view hides something you need to see.  It derives
-;; from `js-json-mode' for syntax highlighting (regexp-based, so no
-;; tree-sitter grammar required) and adds a read-only, `q'-to-bury view;
-;; unlike a `special-mode' buffer that means evil users bind `q'/`g'
+;; when the rendered view hides something you need to see.  Highlighting
+;; comes from `json-ts-mode' when the optional tree-sitter JSON grammar
+;; is installed, else from `js-json-mode' (regexp-based, always
+;; available); either way the mode adds a read-only, `q'-to-bury view.
+;; Since neither parent is a `special-mode', evil users bind `q'/`gr'
 ;; explicitly (see the README).
 
 (defvar-local agmon--json-run-id nil
@@ -1139,10 +1141,21 @@ Buffer-local, so `g' knows what to re-fetch.")
   "q" #'quit-window
   "g" #'revert-buffer)
 
-(define-derived-mode agmon-json-mode js-json-mode "Agmon-JSON"
+(defun agmon--json-parent-mode ()
+  "Enable the best available JSON major mode in the current buffer.
+`json-ts-mode' when the tree-sitter JSON grammar is installed (an
+optional extra -- see the README), otherwise `js-json-mode'.  Decided
+per call, so a grammar installed mid-session is picked up by the next
+JSON buffer without reloading agmon."
+  (if (treesit-ready-p 'json t) (json-ts-mode) (js-json-mode)))
+
+(define-derived-mode agmon-json-mode agmon--json-parent-mode "Agmon-JSON"
   "Major mode for agmon's raw-JSON escape hatch.
 A read-only, syntax-highlighted view of a run's /summary payload; `q'
 buries it and `g' re-fetches."
+  ;; Advertise which backend won; \"[ts]\" also confirms a grammar install.
+  (when (treesit-ready-p 'json t)
+    (setq mode-name "Agmon-JSON[ts]"))
   (setq buffer-read-only t)
   (setq-local revert-buffer-function #'agmon--json-revert))
 
