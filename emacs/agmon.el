@@ -432,8 +432,14 @@ naming an absent column would error at print time."
 (defun agmon--cost-epoch (date)
   "Return DATE, a \"YYYY-MM-DD\" string, as epoch seconds; 0 if unparseable.
 Used only as the Date column's numeric sort value, so the exact epoch and
-timezone do not matter -- only that it orders dates chronologically."
-  (or (ignore-errors (float-time (date-to-time date))) 0))
+timezone do not matter -- only that it orders dates chronologically.
+`date-to-time' parses leniently (a non-date fills in default fields
+rather than erroring), so guard on the YYYY-MM-DD shape before trusting
+it; anything else sorts as 0."
+  (if (and (stringp date)
+           (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}" date))
+      (or (ignore-errors (float-time (date-to-time date))) 0)
+    0))
 
 (defun agmon--cost-cell (text sort &optional face)
   "Return TEXT as a cost-table cell carrying numeric SORT and optional FACE.
