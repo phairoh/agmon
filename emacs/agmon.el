@@ -653,7 +653,7 @@ is nil.  Pure."
       (cons (nreverse from) (nreverse by)))))
 
 (defvar-keymap agmon--lineage-map
-  :doc "Keymap carried on a detail-buffer lineage line, for mouse activation."
+  :doc "Keymap for mouse activation of a detail-buffer link or toggle line."
   "<mouse-1>" #'agmon-detail-follow
   "<mouse-2>" #'agmon-detail-follow)
 
@@ -848,11 +848,15 @@ against a canned payload."
       ;; usually the routine \"read before edit\" kind, so hide by default).
       (when .issues
         (push "" lines)
-        (push (concat (propertize (format "Issues (%d)" (length .issues))
-                                  'face 'agmon-detail-heading)
-                      "   "
-                      (propertize (if show-issues "TAB to hide" "TAB to show")
-                                  'face 'shadow))
+        (push (propertize
+               (concat (if show-issues "▾ " "▸ ")
+                       (propertize (format "Issues (%d)" (length .issues))
+                                   'face 'agmon-detail-heading))
+               ;; RET (or a click) anywhere on the heading toggles the section
+               ;; -- same "activate the thing at point" verb as following a
+               ;; link; the marker signals foldability, as the tail's does.
+               'agmon-toggle 'issues
+               'keymap agmon--lineage-map)
               lines)
         (when show-issues
           (dolist (iss .issues)
@@ -1069,24 +1073,27 @@ The run list feeds the session-lineage section."
   (agmon--detail-render))
 
 (defun agmon-detail-follow (&optional event)
-  "Follow the link at point: a lineage run's detail, or a pipeline list.
+  "Follow the link or toggle the section at point.
 On a mouse EVENT use the click position, otherwise point.  A run id rides
 on the line as an `agmon-run-id' property (opens its detail); a pipeline
-id as `agmon-pipeline' (opens `agmon-list-pipeline').  Bound to RET and
-to a mouse click on those lines."
+id as `agmon-pipeline' (opens `agmon-list-pipeline'); the Issues heading
+carries `agmon-toggle' (expands or collapses that section).  Bound to RET
+and to a mouse click on those lines."
   (interactive (list last-nonmenu-event))
   (let* ((win (if (mouse-event-p event) (posn-window (event-end event))
                 (selected-window)))
          (pos (if (mouse-event-p event) (posn-point (event-end event)) (point)))
          (id (get-text-property pos 'agmon-run-id))
-         (pipeline (get-text-property pos 'agmon-pipeline)))
+         (pipeline (get-text-property pos 'agmon-pipeline))
+         (toggle (get-text-property pos 'agmon-toggle)))
     (cond
      ;; Reuse the current window: a plain window follows same-window, but a
      ;; side window is dedicated -- reopen in its side slot so it reuses that
      ;; window instead of spawning a new one.
      (id (agmon--open-detail id (and (window-parameter win 'window-side) t)))
      (pipeline (agmon-list-pipeline pipeline))
-     (t (user-error "No link at point")))))
+     ((eq toggle 'issues) (agmon-detail-toggle-issues))
+     (t (user-error "Nothing to follow or toggle at point")))))
 
 (defun agmon--open-detail (run-id &optional side)
   "Open, refresh, and select the detail buffer for RUN-ID.
