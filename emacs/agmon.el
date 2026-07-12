@@ -1017,14 +1017,13 @@ flips it.")
 Fetched alongside the summary; a re-render (e.g. the `TAB' toggle) reuses
 it without another round-trip.")
 
-;; `q' (bury) and `g' (revert) are inherited from `special-mode'; we add
-;; TAB to expand/collapse the issues section.  Bind both spellings: `TAB'
-;; is the terminal form (C-i), `<tab>' the event a graphical frame's Tab
-;; key actually sends -- binding only one leaves the other dead on GUIs.
+;; `q' (bury) and `g' (revert) are inherited from `special-mode'.  RET
+;; both follows the link and folds the Issues section at point (see
+;; `agmon-detail-follow'), so it is the single fold verb -- no TAB
+;; binding, which leaves TAB free for navigation (evil users especially,
+;; whose normal state binds nothing to Tab, so a binding here would win).
 (defvar-keymap agmon-detail-mode-map
   :doc "Keymap for `agmon-detail-mode'."
-  "TAB" #'agmon-detail-toggle-issues
-  "<tab>" #'agmon-detail-toggle-issues
   "J" #'agmon-show-json
   "RET" #'agmon-detail-follow
   "t" #'agmon-tail)
