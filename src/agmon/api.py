@@ -8,7 +8,7 @@ import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from . import db, derive
@@ -69,6 +69,35 @@ def _base_run(row: sqlite3.Row) -> dict:
     out["issue_count"] = row["issue_count"]
     out["pid_alive"] = _pid_alive(row["status"], row["pid"])
     return out
+
+
+def _labels_for(conn: sqlite3.Connection, run_ids: list[str]) -> dict[str, dict]:
+    """``{run_id: {key: value, ...}}`` for the given ids (empty dict per id with
+    no labels). One IN query, not a per-row scan."""
+    out: dict[str, dict] = {rid: {} for rid in run_ids}
+    if not run_ids:
+        return out
+    placeholders = ",".join("?" * len(run_ids))
+    for row in conn.execute(
+        f"SELECT run_id, key, value FROM run_labels WHERE run_id IN ({placeholders})",
+        run_ids,
+    ):
+        out.setdefault(row["run_id"], {})[row["key"]] = row["value"]
+    return out
+
+
+def _parse_label_filters(label: list[str]) -> tuple[list[tuple[str, str]], str | None]:
+    """Parse repeatable ``label=key=value`` filters. Returns ``(pairs, error)``;
+    ``error`` is a message string on malformed syntax, else None."""
+    pairs: list[tuple[str, str]] = []
+    for raw in label:
+        if "=" not in raw:
+            return [], f"invalid label filter {raw!r}: expected key=value"
+        key, value = raw.split("=", 1)
+        if not key:
+            return [], f"invalid label filter {raw!r}: empty key"
+        pairs.append((key, value))
+    return pairs, None
 
 
 def _parse_payload(type_: str | None, payload: str):
@@ -135,6 +164,46 @@ def create_app(config: Config | None = None) -> FastAPI:
             config.stall_seconds,
         )
 
+    _RELATED_SELECT = (
+        "SELECT r.*, "
+        "(SELECT MAX(ingested_at) FROM events e WHERE e.run_id = r.run_id) "
+        "  AS last_event_at "
+        "FROM runs r JOIN run_labels rl ON rl.run_id = r.run_id "
+        "WHERE rl.key = ? AND rl.value = ?"
+    )
+
+    def _lineage_for(
+        conn: sqlite3.Connection, run_id: str, labels: dict, now: str
+    ) -> dict | None:
+        """Assemble the pipeline-lineage pool with two indexed run_labels
+        queries (pipeline members + parent-pointers), compute each candidate's
+        effective_status, and hand it to the pure ``derive.derive_lineage``."""
+        rows_by_id: dict[str, sqlite3.Row] = {}
+        pipeline = labels.get("pipeline")
+        if pipeline is not None:
+            for r in conn.execute(_RELATED_SELECT, ("pipeline", pipeline)):
+                rows_by_id[r["run_id"]] = r
+        for r in conn.execute(_RELATED_SELECT, ("parent", run_id)):
+            rows_by_id[r["run_id"]] = r
+        rows_by_id.pop(run_id, None)  # the pool is *other* runs
+        labels_map = _labels_for(conn, list(rows_by_id))
+        related = []
+        for rid, r in rows_by_id.items():
+            run = {c: r[c] for c in _RUN_COLS}
+            st = derive.derive_status(
+                run, r["last_event_at"], _pid_alive(r["status"], r["pid"]),
+                now, config.stall_seconds,
+            )
+            related.append(
+                {
+                    "run_id": rid,
+                    "labels": labels_map.get(rid, {}),
+                    "effective_status": st["effective_status"],
+                    "started_at": r["started_at"],
+                }
+            )
+        return derive.derive_lineage(run_id, labels, related)
+
     @app.get("/healthz")
     def healthz():
         with read() as conn:
@@ -148,19 +217,37 @@ def create_app(config: Config | None = None) -> FastAPI:
         }
 
     @app.get("/v1/runs")
-    def list_runs(status: str | None = None, limit: int = 50):
+    def list_runs(
+        status: str | None = None,
+        limit: int = 50,
+        label: list[str] = Query(default=[]),
+    ):
+        filters, err = _parse_label_filters(label)
+        if err is not None:
+            return JSONResponse({"error": err}, status_code=400)
         sql = _RUN_SELECT
         params: list = []
+        wheres: list[str] = []
         if status is not None:
-            sql += " WHERE r.status = ?"
+            wheres.append("r.status = ?")
             params.append(status)
+        # AND across repeated label= filters: each is an indexed membership test.
+        for key, value in filters:
+            wheres.append(
+                "r.run_id IN (SELECT run_id FROM run_labels WHERE key = ? AND value = ?)"
+            )
+            params += [key, value]
+        if wheres:
+            sql += " WHERE " + " AND ".join(wheres)
         sql += " ORDER BY (r.started_at IS NULL), r.started_at DESC LIMIT ?"
         params.append(limit)
         with read() as conn:
             rows = conn.execute(sql, params).fetchall()
+            labels_map = _labels_for(conn, [row["run_id"] for row in rows])
         items = []
         for row in rows:
             item = _base_run(row)
+            item["labels"] = labels_map.get(row["run_id"], {})
             prompt = row["prompt"]
             item["prompt_preview"] = prompt[:120] if prompt else prompt
             status_ = _status_for(row)
@@ -177,7 +264,10 @@ def create_app(config: Config | None = None) -> FastAPI:
             ).fetchone()
         if row is None:
             return JSONResponse({"error": "unknown run_id"}, status_code=404)
+        with read() as conn:
+            labels = _labels_for(conn, [run_id]).get(run_id, {})
         item = _base_run(row)
+        item["labels"] = labels
         item["prompt"] = row["prompt"]
         item["meta_json"] = json.loads(row["meta_json"]) if row["meta_json"] else None
         return item
@@ -191,10 +281,13 @@ def create_app(config: Config | None = None) -> FastAPI:
             if row is None:
                 return JSONResponse({"error": "unknown run_id"}, status_code=404)
             events = _load_events(conn, run_id)
+            labels = _labels_for(conn, [run_id]).get(run_id, {})
+            now = now_iso()
+            lineage = _lineage_for(conn, run_id, labels, now)
         run = _base_run(row)
+        run["labels"] = labels
         run["prompt"] = row["prompt"]
         run["meta_json"] = json.loads(row["meta_json"]) if row["meta_json"] else None
-        now = now_iso()
         return {
             "run": run,
             "status": derive.derive_status(
@@ -204,6 +297,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             "issues": derive.derive_issues(events),
             "metrics": derive.derive_metrics(run, events, now),
             "result_text": derive.derive_result_text(events),
+            "lineage": lineage,
         }
 
     @app.get("/v1/runs/{run_id}/events")

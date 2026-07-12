@@ -141,12 +141,16 @@ class Client:
         status: str | None = None,
         limit: int = 50,
         session: str | None = None,
+        labels: list[str] | None = None,
     ) -> list[dict]:
-        """Runs newest-first. ``session`` is filtered client-side (the API has
-        no session filter)."""
+        """Runs newest-first. ``labels`` are repeatable ``key=value`` filters
+        applied server-side (AND). ``session`` is filtered client-side (the API
+        has no session filter)."""
         params: dict[str, Any] = {"limit": limit}
         if status is not None:
             params["status"] = status
+        if labels:
+            params["label"] = labels
         runs = self._get("/v1/runs", params)["runs"]
         if session is not None:
             runs = [r for r in runs if r.get("session_id") == session]
