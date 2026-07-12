@@ -34,6 +34,13 @@
 (require 'json)
 (require 'js)
 
+;;;; Internal state
+
+(defvar agmon--timers nil
+  "All live timers agmon has created, across buffers.
+Auto-refresh/poll timers are pushed here (and removed on cleanup) so
+`agmon-dev-reset' and `kill-buffer-hook's can cancel them all.")
+
 ;;;; Customization
 
 (defgroup agmon nil
@@ -57,6 +64,14 @@ changing it, run \\[agmon] to rebuild the list with the new layout.
 
 Available columns: `id', `status', `cwd', `age', `cost', `task'."
   :type '(repeat symbol)
+  :group 'agmon)
+
+(defcustom agmon-list-refresh-seconds 10
+  "Seconds between automatic refreshes of the run list.
+The list re-fetches on this interval, but only while a window actually
+displays it -- a buried list makes no background requests.  Set to 0 to
+disable auto-refresh entirely (\\[revert-buffer] still refreshes by hand)."
+  :type 'natnum
   :group 'agmon)
 
 (defcustom agmon-detail-table-cell-width 36
@@ -138,36 +153,55 @@ for wide frames, lower it for narrow ones."
 ;; both JSON null and false become nil.  This lets us reach into payloads
 ;; with `let-alist' / `alist-get' and walk arrays with `mapcar'/`dolist'.
 
-(defun agmon--request (path &optional raw)
-  "Perform a synchronous GET of PATH and return the JSON body.
+(defun agmon--request (path &optional raw then)
+  "Perform a GET of PATH and return the JSON body.
 PATH is a route beginning with a slash, e.g. \"/v1/runs\"; it is
 appended to `agmon-url'.  By default the body is parsed per the JSON
 representation above; with RAW non-nil it is returned verbatim as a
-string (for the raw-JSON escape hatch).  Signals a `plz-error' if the
-request fails."
-  (let ((url (concat (string-remove-suffix "/" agmon-url) path)))
-    (plz 'get url
-      :as (if raw
-              'string
-            (lambda ()
-              (json-parse-buffer :object-type 'alist
-                                 :array-type 'list
-                                 :null-object nil
-                                 :false-object nil))))))
+string (for the raw-JSON escape hatch).
 
-(defun agmon--runs (&optional status limit)
+Without THEN the request is synchronous: it returns the body and signals
+a `plz-error' on failure.  With THEN it is asynchronous: THEN is called
+with the body when it arrives, failures are reported by
+`agmon--report-request-error' (never by disturbing a buffer), and the
+return value is the underlying process."
+  (let ((url (concat (string-remove-suffix "/" agmon-url) path))
+        (as (if raw
+                'string
+              (lambda ()
+                (json-parse-buffer :object-type 'alist
+                                   :array-type 'list
+                                   :null-object nil
+                                   :false-object nil)))))
+    (if then
+        (plz 'get url :as as :then then
+          :else (lambda (err) (agmon--report-request-error path err)))
+      (plz 'get url :as as))))
+
+(defun agmon--report-request-error (path err)
+  "Report a failed async request to PATH via the echo area.
+ERR is a `plz-error'.  A background refresh must never blank or
+half-draw a buffer, so we only message and leave the last good contents
+in place."
+  (message "agmon: request to %s failed: %S" path err))
+
+(defun agmon--runs (&optional status limit then)
   "Fetch the run list as a list of alists, newest first.
 STATUS filters on the raw meta status; LIMIT caps the number of rows.
-Both are optional and passed through to GET /v1/runs."
-  (let ((query (string-join
-                (delq nil
-                      (list (and status (format "status=%s" status))
-                            (and limit (format "limit=%d" limit))))
-                "&")))
-    (alist-get 'runs
-               (agmon--request (concat "/v1/runs"
-                                       (if (string-empty-p query) ""
-                                         (concat "?" query)))))))
+Without THEN this is synchronous and returns the list; with THEN it is
+asynchronous and THEN is called with the list.  All are optional and
+passed through to GET /v1/runs."
+  (let* ((query (string-join
+                 (delq nil
+                       (list (and status (format "status=%s" status))
+                             (and limit (format "limit=%d" limit))))
+                 "&"))
+         (path (concat "/v1/runs"
+                       (if (string-empty-p query) "" (concat "?" query)))))
+    (if then
+        (agmon--request path nil
+                        (lambda (data) (funcall then (alist-get 'runs data))))
+      (alist-get 'runs (agmon--request path)))))
 
 (defun agmon--summary (run-id)
   "Fetch the parsed /summary payload for RUN-ID.
@@ -657,7 +691,10 @@ against a canned payload."
   ;; `g' (revert-buffer, inherited from `special-mode') calls this hook,
   ;; then reprints from `tabulated-list-entries' -- so refresh is free.
   (add-hook 'tabulated-list-revert-hook #'agmon--list-refresh nil t)
-  (tabulated-list-init-header))
+  ;; Stop polling when this buffer dies; start the visibility-gated timer.
+  (add-hook 'kill-buffer-hook #'agmon--list-cleanup nil t)
+  (tabulated-list-init-header)
+  (agmon--list-start-timer))
 
 (defun agmon-sort-default ()
   "Restore the default newest-first sort in an agmon list buffer."
@@ -679,9 +716,57 @@ against a canned payload."
 (keymap-set agmon-list-mode-map "J" #'agmon-show-json)
 
 (defun agmon--list-refresh ()
-  "Re-fetch the run list into `tabulated-list-entries'.
-Installed on `tabulated-list-revert-hook', so `g' refreshes."
+  "Re-fetch the run list into `tabulated-list-entries', synchronously.
+Installed on `tabulated-list-revert-hook', so `g' refreshes now (blocking
+on a manual refresh is fine); the timer path uses `agmon--list-auto-refresh'."
   (setq tabulated-list-entries (agmon--run-entries (agmon--runs))))
+
+;; Auto-refresh: a repeating timer re-fetches the list, but the callback
+;; runs only when a window actually shows the buffer -- so a buried list
+;; never chatters on the network -- and the fetch is async so Emacs never
+;; blocks on it.  The timer is buffer-local and cancelled on
+;; `kill-buffer-hook', which is what makes killing the buffer provably
+;; stop all polling (`M-x list-timers').
+
+(defvar-local agmon--list-timer nil
+  "This list buffer's repeating auto-refresh timer, or nil.
+Cancelled on `kill-buffer-hook' so a killed buffer stops polling.")
+
+(defun agmon--list-auto-refresh (buffer)
+  "Async-refresh the run list in BUFFER, but only while it is visible.
+The visibility gate means a buried list issues no background requests.
+Point (kept on the same run id) and the sort survive the reprint; on a
+request failure the last good list stays put."
+  (when (and (buffer-live-p buffer) (get-buffer-window buffer 'visible))
+    (agmon--runs
+     nil nil
+     (lambda (runs)
+       ;; The buffer may have been killed while the request was in flight.
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (setq tabulated-list-entries (agmon--run-entries runs))
+           (tabulated-list-print t)))))))   ; t: keep point-on-id and sort
+
+(defun agmon--list-start-timer ()
+  "Start this list buffer's repeating auto-refresh timer.
+Does nothing when `agmon-list-refresh-seconds' is zero."
+  (when agmon--list-timer (cancel-timer agmon--list-timer))
+  (setq agmon--list-timer nil)
+  (when (> agmon-list-refresh-seconds 0)
+    (let ((timer (run-with-timer agmon-list-refresh-seconds
+                                 agmon-list-refresh-seconds
+                                 #'agmon--list-auto-refresh
+                                 (current-buffer))))
+      (setq agmon--list-timer timer)
+      (push timer agmon--timers))))
+
+(defun agmon--list-cleanup ()
+  "Cancel this buffer's auto-refresh timer.
+Installed on `kill-buffer-hook', so killing the buffer stops polling."
+  (when agmon--list-timer
+    (cancel-timer agmon--list-timer)
+    (setq agmon--timers (delq agmon--list-timer agmon--timers))
+    (setq agmon--list-timer nil)))
 
 ;;;; Run detail buffer
 ;;
@@ -920,11 +1005,6 @@ substring id matching, this offers every run for interactive narrowing."
     (pop-to-buffer buf)))
 
 ;;;; Development helpers
-
-(defvar agmon--timers nil
-  "List of timers created by agmon.
-Later stages push refresh/poll timers here so `agmon-dev-reset' and
-cleanup hooks can cancel them all.")
 
 (defun agmon-dev-reset ()
   "Cancel every agmon timer and kill every agmon buffer.
