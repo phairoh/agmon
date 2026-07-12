@@ -167,6 +167,10 @@ screen lines.  Set to 0 to never truncate."
   "Face for PROGRESS lines in the event tail -- the bright, watch-for-me line."
   :group 'agmon)
 
+(defface agmon-costs-total '((t :inherit bold))
+  "Face for the pinned totals row of the cost rollup."
+  :group 'agmon)
+
 ;;;; HTTP transport
 ;;
 ;; Every request in this package goes through `agmon--request'.  Nothing
@@ -415,6 +419,74 @@ Nil (server order) when the Age column is hidden, since a sort key
 naming an absent column would error at print time."
   (when (memq 'age agmon-list-columns)
     (cons "Age" t)))
+
+;; The cost rollup (GET /v1/stats/costs) is a second tabulated-list screen:
+;; one row per day (date, run count, cost, turns) plus a bold totals row.
+;; These builders are pure -- they turn the parsed payload into
+;; `tabulated-list-entries' with no network or buffer state -- so ERT can
+;; drive them with a canned alist.  Each numeric cell stashes its raw value
+;; on an `agmon-sort' property, reusing `agmon--numeric-sorter' for the
+;; column sorts exactly as the run list does.
+
+(defun agmon--cost-epoch (date)
+  "Return DATE, a \"YYYY-MM-DD\" string, as epoch seconds; 0 if unparseable.
+Used only as the Date column's numeric sort value, so the exact epoch and
+timezone do not matter -- only that it orders dates chronologically."
+  (or (ignore-errors (float-time (date-to-time date))) 0))
+
+(defun agmon--cost-cell (text sort &optional face)
+  "Return TEXT as a cost-table cell carrying numeric SORT and optional FACE.
+SORT is stashed on an `agmon-sort' text property (read by
+`agmon--numeric-sorter'); FACE, when given, propertizes the whole cell."
+  (let ((s (copy-sequence text)))
+    (when (> (length s) 0)
+      (put-text-property 0 (length s) 'agmon-sort sort s)
+      (when face (put-text-property 0 (length s) 'face face s)))
+    s))
+
+(defun agmon--cost-entries (payload)
+  "Return a `tabulated-list-entries' value for the cost rollup PAYLOAD.
+PAYLOAD is the parsed /v1/stats/costs alist: a `buckets' list of daily
+\(bucket runs total_cost_usd total_turns) records and a `totals' summary.
+Each bucket becomes a row; a final bold totals row (sort value 0 in every
+column, so the default newest-first order floats it to the bottom and any
+numeric re-sort sends it to an edge rather than mid-table) sums the fleet."
+  (let ((rows
+         (mapcar
+          (lambda (b)
+            (let-alist b
+              (list .bucket
+                    (vector
+                     (agmon--cost-cell .bucket (agmon--cost-epoch .bucket))
+                     (agmon--cost-cell (number-to-string .runs) .runs)
+                     (agmon--cost-cell (agmon--format-cost .total_cost_usd)
+                                       (if (numberp .total_cost_usd)
+                                           .total_cost_usd 0))
+                     (agmon--cost-cell (number-to-string .total_turns)
+                                       .total_turns)))))
+          (alist-get 'buckets payload))))
+    (let-alist (alist-get 'totals payload)
+      (append
+       rows
+       (list (list 'agmon-totals
+                   (vector
+                    (agmon--cost-cell "TOTAL" 0 'agmon-costs-total)
+                    (agmon--cost-cell (number-to-string .runs) 0
+                                      'agmon-costs-total)
+                    (agmon--cost-cell (agmon--format-cost .total_cost_usd) 0
+                                      'agmon-costs-total)
+                    (agmon--cost-cell (number-to-string .total_turns) 0
+                                      'agmon-costs-total))))))))
+
+(defun agmon--costs-format ()
+  "Build the `tabulated-list-format' vector for the cost rollup.
+Every column sorts numerically off its cell's `agmon-sort' property, so
+Date orders chronologically and the count/cost columns by value."
+  (vector
+   (list "Date"  12 (agmon--numeric-sorter 0))
+   (list "Runs"  6  (agmon--numeric-sorter 1) :right-align t)
+   (list "Cost"  10 (agmon--numeric-sorter 2) :right-align t)
+   (list "Turns" 7  (agmon--numeric-sorter 3) :right-align t)))
 
 (defun agmon--oneline (s)
   "Collapse each whitespace sequence in S to a single space, trimmed."
@@ -846,6 +918,9 @@ against a canned payload."
 
 ;; `t' opens a live event tail for the run at point.
 (keymap-set agmon-list-mode-map "t" #'agmon-tail)
+
+;; `$' opens the fleet-wide cost rollup (a separate screen, not per-run).
+(keymap-set agmon-list-mode-map "$" #'agmon-costs)
 
 (defvar-local agmon--list-labels nil
   "Label filters (\"key=value\" strings) active in this list buffer, or nil.
@@ -1644,6 +1719,53 @@ pipelines currently in the fleet."
       (setq tabulated-list-format (agmon--list-format))
       (tabulated-list-init-header)
       (agmon--list-refresh)
+      (tabulated-list-print))
+    (pop-to-buffer buf)))
+
+;;;; Cost rollup
+;;
+;; A fleet-wide view (not per-run): GET /v1/stats/costs, one row per day
+;; plus a pinned totals row, rendered as a second `tabulated-list-mode'
+;; screen.  It shares the run list's numeric-sort machinery but keeps its
+;; own tiny mode; unlike the list it does not auto-refresh (costs move
+;; slowly -- `g' re-fetches by hand).
+
+(defun agmon--costs-refresh ()
+  "Re-fetch the cost rollup into `tabulated-list-entries', synchronously.
+Installed on `tabulated-list-revert-hook', so \\[revert-buffer] refreshes."
+  (setq tabulated-list-entries
+        (agmon--cost-entries (agmon--request "/v1/stats/costs"))))
+
+(define-derived-mode agmon-costs-mode tabulated-list-mode "Agmon-Costs"
+  "Major mode for the agmon cost rollup: a daily cost/turns/run-count table.
+
+\\{agmon-costs-mode-map}"
+  (setq tabulated-list-format (agmon--costs-format))
+  ;; Newest day first; the `t' flips the numeric Date sort to descending.
+  (setq tabulated-list-sort-key (cons "Date" t))
+  (setq tabulated-list-padding 1)
+  (add-hook 'tabulated-list-revert-hook #'agmon--costs-refresh nil t)
+  (tabulated-list-init-header))
+
+(defun agmon-costs-sort-default ()
+  "Restore the default newest-day-first sort in the cost buffer."
+  (interactive)
+  (setq tabulated-list-sort-key (cons "Date" t))
+  (tabulated-list-init-header)
+  (tabulated-list-print t))
+
+;; `o' restores the default sort after a column-header click, mirroring the
+;; run list.  (`g' revert and `q' bury come from `tabulated-list-mode'.)
+(keymap-set agmon-costs-mode-map "o" #'agmon-costs-sort-default)
+
+;;;###autoload
+(defun agmon-costs ()
+  "Open the *agmon-costs* buffer: the fleet's daily cost rollup."
+  (interactive)
+  (let ((buf (get-buffer-create "*agmon-costs*")))
+    (with-current-buffer buf
+      (agmon-costs-mode)
+      (agmon--costs-refresh)
       (tabulated-list-print))
     (pop-to-buffer buf)))
 
