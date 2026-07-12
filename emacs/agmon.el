@@ -1174,15 +1174,45 @@ A bare string content counts as one block."
                      'shadow))))))
       (_ (cons (format "%s" (or etype (alist-get 'type event) "?")) 'shadow)))))
 
-(defun agmon--tail-event-line (event show-all)
-  "Render EVENT as a propertized tail line, or nil when filtered out.
-Events whose type is in `agmon-tail-hidden-types' are dropped unless
-SHOW-ALL.  The line is truncated to `agmon-tail-line-width'."
-  (unless (and (not show-all)
-               (member (agmon--event-type event) agmon-tail-hidden-types))
-    (let* ((s (agmon--summarize-event event))
-           (width (and (> agmon-tail-line-width 0) agmon-tail-line-width)))
-      (propertize (agmon--truncate (car s) width) 'face (cdr s)))))
+(defun agmon--tail-render-line (event)
+  "Render EVENT as a propertized one-line tail summary (no filtering).
+The line is truncated to `agmon-tail-line-width'."
+  (let* ((s (agmon--summarize-event event))
+         (width (and (> agmon-tail-line-width 0) agmon-tail-line-width)))
+    (propertize (agmon--truncate (car s) width) 'face (cdr s))))
+
+(defun agmon--assistant-empty-p (event)
+  "Non-nil if EVENT is an assistant turn with no text, tool_use, or PROGRESS.
+These carry only thinking, whose body is empty in the spool, so the tail
+curates them out unless showing everything."
+  (and (equal (agmon--event-type event) "assistant")
+       (not (agmon--event-progress event))
+       (not (seq-find (lambda (b) (equal (alist-get 'type b) "tool_use"))
+                      (agmon--event-blocks event)))
+       (not (seq-find (lambda (s) (agmon--nonempty (agmon--oneline s)))
+                      (agmon--event-text-blocks event)))))
+
+(defun agmon--tail-low-value-p (event)
+  "Non-nil if EVENT is curated out of the tail by default.
+True for a type in `agmon-tail-hidden-types' and for a thinking-only
+assistant turn (see `agmon--assistant-empty-p')."
+  (or (member (agmon--event-type event) agmon-tail-hidden-types)
+      (agmon--assistant-empty-p event)))
+
+(defun agmon--tail-prose (event)
+  "Return EVENT's assistant prose text if it is a plain prose turn, else nil.
+A prose turn is an assistant message with a non-empty text block but no
+PROGRESS line and no tool call -- the kind worth folding open."
+  (and (equal (agmon--event-type event) "assistant")
+       (not (agmon--event-progress event))
+       (not (seq-find (lambda (b) (equal (alist-get 'type b) "tool_use"))
+                      (agmon--event-blocks event)))
+       (let ((texts (agmon--event-text-blocks event)))
+         (and texts (agmon--nonempty (string-trim (car (last texts))))))))
+
+(defun agmon--tail-indent (text)
+  "Indent every line of TEXT by four spaces for the folded-open body."
+  (mapconcat (lambda (l) (concat "    " l)) (split-string text "\n") "\n"))
 
 (defun agmon--tail-summary-line (status metrics)
   "Render the tail's terminal verdict line from STATUS and METRICS."
@@ -1220,9 +1250,13 @@ SHOW-ALL.  The line is truncated to `agmon-tail-line-width'."
 (defvar-local agmon--tail-show-all nil "Non-nil to show `agmon-tail-hidden-types' too.")
 (defvar-local agmon--tail-stalled-shown nil "Non-nil once a stall heartbeat was printed.")
 
+;; Bind both TAB spellings: `<tab>' is what a graphical frame's Tab key
+;; sends, `TAB' the terminal (C-i) fallback.
 (defvar-keymap agmon-tail-mode-map
   :doc "Keymap for `agmon-tail-mode'."
-  "a" #'agmon-tail-toggle-all)
+  "a" #'agmon-tail-toggle-all
+  "TAB" #'agmon-tail-toggle-line
+  "<tab>" #'agmon-tail-toggle-line)
 
 (define-derived-mode agmon-tail-mode special-mode "Agmon-Tail"
   "Major mode for a live event tail of one run.
@@ -1230,6 +1264,9 @@ SHOW-ALL.  The line is truncated to `agmon-tail-line-width'."
 \\{agmon-tail-mode-map}"
   (setq-local revert-buffer-function #'agmon--tail-revert)
   (visual-line-mode 1)
+  ;; Prose bodies fold via overlays whose `invisible' property is this
+  ;; symbol; registering it once lets each overlay hide/show on its own.
+  (add-to-invisibility-spec 'agmon-prose)
   (add-hook 'kill-buffer-hook #'agmon--tail-cancel-timer nil t))
 
 (defun agmon--tail-cancel-timer ()
@@ -1251,22 +1288,74 @@ On `kill-buffer-hook', so killing the buffer provably stops polling."
                               #'agmon--tail-poll buffer))
         (push agmon--tail-timer agmon--timers)))))
 
+(defmacro agmon--tail-following (&rest body)
+  "Run BODY, preserving the buffer's bottom-follow.
+BODY should insert at the end of the buffer.  Any window parked at the
+end, and point if it was at the end, stays pinned to the new bottom; a
+window scrolled up is left alone."
+  (declare (indent 0) (debug t))
+  `(let ((inhibit-read-only t)
+         (at-point-end (>= (point) (point-max)))
+         (follow (seq-filter (lambda (w) (>= (window-point w) (point-max)))
+                             (get-buffer-window-list (current-buffer) nil t))))
+     (save-excursion (goto-char (point-max)) ,@body)
+     (dolist (w follow) (set-window-point w (point-max)))
+     (when at-point-end (goto-char (point-max)))))
+
 (defun agmon--tail-insert (strings)
-  "Append STRINGS (rendered lines) at end of buffer, following at the bottom.
-A window parked at the end (and point, if it was at the end) stays
-pinned to the new bottom; a window scrolled up is left where it is."
+  "Append STRINGS (already-rendered lines) at the end, following the bottom."
   (when strings
-    (let ((inhibit-read-only t)
-          (windows (get-buffer-window-list (current-buffer) nil t))
-          (at-point-end (>= (point) (point-max)))
-          (follow nil))
-      (dolist (w windows)
-        (when (>= (window-point w) (point-max)) (push w follow)))
-      (save-excursion
-        (goto-char (point-max))
-        (insert (mapconcat #'identity strings "\n") "\n"))
-      (dolist (w follow) (set-window-point w (point-max)))
-      (when at-point-end (goto-char (point-max))))))
+    (agmon--tail-following
+      (insert (mapconcat #'identity strings "\n") "\n"))))
+
+(defun agmon--tail-append-events (events show-all)
+  "Render and append EVENTS, following the bottom; SHOW-ALL bypasses the filter."
+  (when events
+    (agmon--tail-following
+      (dolist (e events) (agmon--tail-insert-one e show-all)))))
+
+(defun agmon--tail-insert-one (event show-all)
+  "Insert EVENT's tail representation at point, or nothing if filtered.
+Unless SHOW-ALL, low-value events (`agmon--tail-low-value-p') are
+dropped.  Assistant prose is inserted collapsed to one line, its full
+text held in an invisible overlay that `agmon-tail-toggle-line' folds open."
+  (unless (and (not show-all) (agmon--tail-low-value-p event))
+    (let ((prose (agmon--tail-prose event)))
+      (if prose
+          (agmon--tail-insert-prose prose)
+        (insert (agmon--tail-render-line event) "\n")))))
+
+(defun agmon--tail-fold-marker (collapsed)
+  "Return the fold marker string: a closed triangle when COLLAPSED, else open."
+  (propertize (if collapsed "▸ " "▾ ") 'face 'agmon-tail-progress))
+
+(defun agmon--tail-insert-prose (full)
+  "Insert assistant prose FULL collapsed to one line, foldable open with TAB.
+When there is more than the one-line summary shows, the full text goes in
+below inside an overlay hidden via the `agmon-prose' invisibility spec, a
+`▸'/`▾' marker leads the summary line (an overlay `before-string'), and
+the summary carries the body overlay on an `agmon-prose-ov' property.
+Short prose that fits on its line is inserted plain, with no marker."
+  (let* ((width (and (> agmon-tail-line-width 0) agmon-tail-line-width))
+         (oneline (agmon--oneline full))
+         (summary (agmon--truncate oneline width))
+         (expandable (or (string-search "\n" (string-trim full))
+                         (and width (> (length oneline) width))))
+         (start (point)))
+    (if (not expandable)
+        (insert (propertize summary 'face 'shadow) "\n")
+      (insert (propertize summary 'face 'shadow
+                          'mouse-face 'highlight
+                          'help-echo "TAB: fold open/closed")
+              "\n")
+      (let ((body-start (point)))
+        (insert (propertize (agmon--tail-indent full) 'face 'shadow) "\n")
+        (let ((body (make-overlay body-start (point)))
+              (mark (make-overlay start (1- body-start))))
+          (overlay-put body 'invisible 'agmon-prose)
+          (overlay-put body 'agmon-mark mark)
+          (overlay-put mark 'before-string (agmon--tail-fold-marker t))
+          (put-text-property start (point) 'agmon-prose-ov body))))))
 
 (defun agmon--tail-poll (buffer)
   "One poll round for BUFFER: fetch events after the cursor and consume them.
@@ -1296,9 +1385,7 @@ requests); reschedules itself unless the run is terminal."
   "Render BATCH's events into the buffer and act on terminal signals."
   (let ((events (alist-get 'events batch))
         (next (alist-get 'next_after batch)))
-    (agmon--tail-insert
-     (delq nil (mapcar (lambda (e) (agmon--tail-event-line e agmon--tail-show-all))
-                       events)))
+    (agmon--tail-append-events events agmon--tail-show-all)
     (when next (setq agmon--tail-cursor next))
     (cond
      ;; A result event means the run finished/errored: stop now, verdict async.
@@ -1355,8 +1442,24 @@ Installed as `revert-buffer-function', so `g' (or `gr' under evil) restarts."
   (setq agmon--tail-cursor 0
         agmon--tail-terminal nil
         agmon--tail-stalled-shown nil)
-  (let ((inhibit-read-only t)) (erase-buffer))
+  (let ((inhibit-read-only t))
+    (remove-overlays)                     ; drop the old prose folds
+    (erase-buffer))
   (agmon--tail-poll (current-buffer)))
+
+(defun agmon-tail-toggle-line ()
+  "Fold the assistant prose at point open or closed, flipping its marker.
+No-op with a message when point is not on a foldable prose line."
+  (interactive)
+  (let ((ov (get-text-property (point) 'agmon-prose-ov)))
+    (if (not ov)
+        (message "agmon: no foldable prose here")
+      (let ((now-collapsed (not (overlay-get ov 'invisible)))
+            (mark (overlay-get ov 'agmon-mark)))
+        (overlay-put ov 'invisible (and now-collapsed 'agmon-prose))
+        (when mark
+          (overlay-put mark 'before-string
+                       (agmon--tail-fold-marker now-collapsed)))))))
 
 (defun agmon-tail-toggle-all ()
   "Toggle showing every event type, including the low-value ones, then restart."
@@ -1370,7 +1473,8 @@ Installed as `revert-buffer-function', so `g' (or `gr' under evil) restarts."
   "Open a live event tail for RUN-ID, defaulting to the run at point.
 Works from the run list and a detail buffer.  The buffer polls while
 visible and stops at a terminal status; `a' toggles the low-value
-filter, `q' buries, `g' restarts."
+filter, `TAB' folds assistant prose open/closed, `q' buries, `g'
+restarts."
   (interactive)
   (let ((id (or run-id (agmon--run-id-at-point))))
     (unless id (user-error "No run at point"))
@@ -1381,7 +1485,7 @@ filter, `q' buries, `g' restarts."
               agmon--tail-cursor 0
               agmon--tail-terminal nil
               agmon--tail-stalled-shown nil)
-        (let ((inhibit-read-only t)) (erase-buffer)))
+        (let ((inhibit-read-only t)) (remove-overlays) (erase-buffer)))
       (pop-to-buffer buf)
       (agmon--tail-poll buf))))
 
