@@ -159,6 +159,24 @@ export AGMON_URL=http://server-box:8400
 agmon ls
 ```
 
+## Emacs
+
+An Emacs client lives in [`emacs/`](emacs/) — the same read-only API rendered as
+native buffers: a live-refreshing run list, per-run detail views, a follow-along
+event tail, and the cost rollup. Like the CLI's read commands, it needs only the
+server URL and works from anywhere on the tailnet.
+
+```elisp
+(add-to-list 'load-path "/path/to/agmon/emacs")
+(require 'agmon)
+(setq agmon-url "http://server-box:8400")
+;; M-x agmon
+```
+
+Full install, configuration, per-buffer keys, the recommended evil/Doom setup,
+and the optional tree-sitter JSON grammar are documented in
+[`emacs/README.org`](emacs/README.org).
+
 ## Tests
 
 ```sh
@@ -167,6 +185,9 @@ uv run pytest
 
 Tests drive the scan step directly (`app.state.ingester.scan()`) rather than
 sleeping on the polling thread.
+
+The Emacs client has its own ERT suite (`emacs/agmon-tests.el`) over its pure
+layer; see [`emacs/README.org`](emacs/README.org#tests) for how to run it.
 
 ## API
 
@@ -303,6 +324,10 @@ src/agmon/
   cli.py       # argument parsing + wiring (agmon ls/show/tail/events/costs/serve/run)
   runner.py    # `agmon run` — the ported launch/spool wrapper
   __main__.py  # `python -m agmon` (the CLI)
+emacs/
+  agmon.el        # the Emacs client (list/detail/tail/costs/json)
+  agmon-tests.el  # ERT tests for the pure layer
+  README.org      # install, keys, evil/Doom setup, tree-sitter, tests
 tests/
   test_agmon.py        # ingester + core API
   test_adversarial.py  # byte-offset / crash-durability

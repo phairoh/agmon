@@ -1,0 +1,258 @@
+#+TITLE: agmon.el — an Emacs client for agmon
+#+OPTIONS: toc:2
+
+=agmon.el= is an Emacs client for the [[https://github.com/phairoh/agmon][agmon]] run monitor. It hits the same
+read-only HTTP API the CLI does and renders the run fleet as native Emacs
+buffers: a live-refreshing run list, per-run detail views, a follow-along
+event tail, and a fleet cost rollup. It talks only to the server over the
+network, so it runs anywhere on your tailnet — no local spool required.
+
+* Requirements
+
+- Emacs 30.1 or newer.
+- [[https://github.com/alphapapa/plz.el][plz]] 0.9+ (the HTTP library; every request goes through it).
+- A reachable agmon server (see the top-level README for =agmon serve=).
+- /Optional:/ the tree-sitter JSON grammar, for nicer syntax highlighting in
+  the raw-JSON view. Everything works without it (see [[*Optional: tree-sitter JSON][below]]).
+
+* Install
+
+The Lisp lives in this =emacs/= subdirectory of the agmon repo. Clone the
+repo, put the directory on your =load-path=, and require it:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/agmon/emacs")
+(require 'agmon)
+#+end_src
+
+With =use-package= + a checkout:
+
+#+begin_src emacs-lisp
+(use-package agmon
+  :load-path "/path/to/agmon/emacs"
+  :commands (agmon agmon-jump agmon-list-pipeline agmon-costs))
+#+end_src
+
+Or via =package-vc-install= (Emacs 30 builds it straight from the repo; the
+Lisp is in a subdirectory, so pass =:lisp-dir=):
+
+#+begin_src emacs-lisp
+(package-vc-install
+ '(agmon :url "https://github.com/phairoh/agmon" :lisp-dir "emacs"))
+#+end_src
+
+Then point it at your server (see [[*Configuration][Configuration]]) and run =M-x agmon=.
+
+* Configuration
+
+Set at minimum =agmon-url=. It defaults to the =AGMON_URL= environment
+variable, or =http://localhost:8400= when that is unset.
+
+#+begin_src emacs-lisp
+(setq agmon-url "http://server-box:8400")
+#+end_src
+
+All user options (=M-x customize-group RET agmon=):
+
+| Option                          | Default                              | Meaning                                              |
+|---------------------------------+--------------------------------------+------------------------------------------------------|
+| =agmon-url=                     | =$AGMON_URL= or =localhost:8400=     | Base URL of the server, no trailing slash            |
+| =agmon-list-columns=            | =(id status phase cwd age cost task)= | Run-list columns — order /and/ visibility            |
+| =agmon-list-refresh-seconds=    | =10=                                 | Auto-refresh interval for the list (=0= disables)    |
+| =agmon-detail-table-cell-width= | =36=                                 | Max width of a Markdown table cell in the detail view |
+| =agmon-tail-poll-seconds=       | =2=                                  | Poll interval for the event tail                     |
+| =agmon-tail-hidden-types=       | =("system" "rate_limit_event")=      | Event types the tail hides by default as noise       |
+| =agmon-tail-line-width=         | =200=                                | Max width of a rendered tail line (=0= = no truncation) |
+
+Faces (=defface=, all theme-tracking): =agmon-status-*= for the run statuses,
+=agmon-detail-*= for the detail view, =agmon-tail-progress= for PROGRESS
+lines, =agmon-costs-total= for the cost totals row. Retune via
+=M-x customize-group RET agmon=.
+
+* Entry points
+
+| Command              | Opens                                                    |
+|----------------------+----------------------------------------------------------|
+| =M-x agmon=          | =*agmon*= — the run list (every run in the fleet)        |
+| =M-x agmon-jump=     | =completing-read= over every run, opens its detail       |
+| =M-x agmon-list-pipeline= | a run list filtered to one pipeline label           |
+| =M-x agmon-costs=    | =*agmon-costs*= — the fleet-wide daily cost rollup       |
+
+From the run list you can reach everything else, so =M-x agmon= is the usual
+door in.
+
+* The screens and their keys
+
+Every buffer is read-only. =?= shows the mode help (=describe-mode=); =C-h m=
+does the same and additionally lists every active binding (including, for evil
+users, whatever your config adds).
+
+** Run list (=*agmon*=)
+
+One row per run; auto-refreshes while a window shows it.
+
+| Key   | Action                                             |
+|-------+----------------------------------------------------|
+| =RET= | open the run at point (detail view)                |
+| =t=   | tail the run at point (live event stream)          |
+| =J=   | raw =/summary= JSON for the run at point           |
+| =$=   | fleet cost rollup                                  |
+| =o=   | restore the default newest-first sort              |
+| =g=   | refresh now                                        |
+| =q=   | bury the buffer                                    |
+| =?=   | mode help                                          |
+
+Column headers sort. =agmon-list-columns= controls which columns show and in
+what order.
+
+** Run detail (=*agmon: <id>*=)
+
+=RET= acts on whatever is at point — it follows a lineage/pipeline link, or
+folds the *Issues* section when point is on its ▸/▾ heading. One verb,
+context-sensitive.
+
+| Key   | Action                                             |
+|-------+----------------------------------------------------|
+| =RET= | follow the link / fold the Issues section at point |
+| =t=   | tail this run                                      |
+| =J=   | raw =/summary= JSON                                |
+| =g=   | refresh                                            |
+| =q=   | bury                                               |
+| =?=   | mode help                                          |
+
+** Event tail (=*agmon-tail: <id>*=)
+
+Each line is one event as an editorial summary; the tail polls while visible
+and stops at a terminal status.
+
+| Key   | Action                                                     |
+|-------+------------------------------------------------------------|
+| =TAB= | fold/unfold the assistant prose on the line at point (▸/▾) |
+| =a=   | toggle the low-value event types (=agmon-tail-hidden-types=) |
+| =g=   | refresh                                                    |
+| =q=   | bury                                                       |
+| =?=   | mode help                                                  |
+
+** Cost rollup (=*agmon-costs*=)
+
+One row per day, newest first, with a bold pinned =TOTAL= row (a real buffer
+row — select and copy it like any text).
+
+| Key   | Action                                    |
+|-------+-------------------------------------------|
+| =o=   | restore the default newest-day-first sort |
+| =g=   | re-fetch                                  |
+| =q=   | bury                                      |
+| =?=   | mode help                                 |
+
+Column headers sort.
+
+** Raw JSON (=*agmon-json: <id>*=)
+
+A read-only, syntax-highlighted dump of a run's =/summary= — the escape hatch
+when the rendered view hides something. =q= buries, =g= re-fetches, =?= helps.
+
+* Using agmon under evil
+
+Evil's state keymaps outrank a major-mode map, so agmon's single-key bindings
+get shadowed until you lift them. Put the setup in your =use-package= =:config=
+(Doom: =use-package!=; otherwise =(with-eval-after-load 'agmon ...)=, or
+=after!=).
+
+One rule keeps it painless — *one mechanism per map*: lift a map above evil
+either by marking it overriding (=evil-make-overriding-map=) or by listing its
+keys in an =evil-define-key= block, never both (they don't compose). The list
+uses the first, so its keys and column sorts ride along for free (plus a patch
+to restore =gg=); the other buffers use the second, so each lists =q= and
+refreshes with =gr=. The comments below say why each key is there.
+
+#+begin_src emacs-lisp
+(use-package agmon
+  :load-path "/path/to/agmon/emacs"
+  :commands (agmon agmon-jump agmon-list-pipeline agmon-costs)
+  :init (setq agmon-url "http://server-box:8400")
+  :config
+  ;; List: overriding + a one-key patch to restore `gg'.
+  (evil-make-overriding-map agmon-list-mode-map)
+  (evil-define-key '(normal motion) agmon-list-mode-map
+    "gg" #'evil-goto-first-line)
+
+  ;; Detail: aux-only.  RET both follows links and folds Issues at point.
+  (evil-define-key '(normal motion) agmon-detail-mode-map
+    "gr"          #'revert-buffer
+    "J"           #'agmon-show-json
+    (kbd "RET")   #'agmon-detail-follow
+    "t"           #'agmon-tail
+    "q"           #'quit-window)
+
+  ;; Tail: aux-only.  TAB folds the prose on the line at point.
+  (evil-define-key '(normal motion) agmon-tail-mode-map
+    "a"           #'agmon-tail-toggle-all
+    (kbd "TAB")   #'agmon-tail-toggle-line
+    (kbd "<tab>") #'agmon-tail-toggle-line   ; a GUI Tab sends <tab>, not TAB
+    "gr"          #'revert-buffer
+    "q"           #'quit-window)
+
+  ;; Costs: aux-only.
+  (evil-define-key '(normal motion) agmon-costs-mode-map
+    "gr" #'revert-buffer
+    "o"  #'agmon-costs-sort-default
+    "q"  #'quit-window)
+
+  ;; JSON: aux-only.  This view derives from a JSON *prog* mode, not
+  ;; special-mode, so evil treats it as editable -- you MUST list q/gr here,
+  ;; or q records a macro instead of burying the buffer.
+  (evil-define-key '(normal motion) agmon-json-mode-map
+    "gr" #'revert-buffer
+    "q"  #'quit-window))
+#+end_src
+
+Optionally, run the detail buffer in evil's *motion* state — its natural home
+for a read-only view — so =TAB= navigates (=evil-jump-item=) for free:
+
+#+begin_src emacs-lisp
+(evil-set-initial-state 'agmon-detail-mode 'motion)
+#+end_src
+
+Two things that trip people up:
+
+- =?= stays =evil-ex-search-backward= in these buffers; under evil, use
+  =C-h m= for help.
+- After changing keymap config, reopen the buffer — evil normalizes keymaps on
+  mode entry. And *removing* a binding needs a restart or an explicit unbind:
+  =evil-define-key= only ever /adds/, so deleting a line and re-evaluating does
+  not retract the old binding.
+
+* Optional: tree-sitter JSON
+
+The raw-JSON view (=J=) uses =json-ts-mode= when the tree-sitter JSON grammar
+is installed, and falls back to =js-json-mode= (regexp-based, no grammar) when
+it is not — so it always works. The choice is made per buffer, so installing
+the grammar mid-session applies to the next =J=. To install it once:
+
+#+begin_src
+M-x treesit-install-language-grammar RET json RET
+#+end_src
+
+(Needs a C compiler and =git=; it clones and builds =libtree-sitter-json= into
+=~/.config/emacs/tree-sitter/=.) When the tree-sitter backend is active, the
+mode line reads =Agmon-JSON[ts]=.
+
+* Tests
+
+The pure layer (formatting, entry construction, event summaries, cost/lineage
+derivation — everything network-free) is covered by ERT in =agmon-tests.el=.
+
+In a running Emacs (where =plz= is already loaded):
+
+#+begin_src
+M-x ert RET t RET
+#+end_src
+
+Headless, with =plz= on the =load-path= (=agmon= requires it at load time; the
+tests never call it):
+
+#+begin_src sh
+emacs -batch -L /path/to/plz -L . \
+  -l ert -l agmon-tests.el -f ert-run-tests-batch-and-exit
+#+end_src
