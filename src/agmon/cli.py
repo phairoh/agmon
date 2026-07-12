@@ -94,14 +94,30 @@ def _tabular(ctx: Ctx, args, objects: list[dict], default_builder, *, json_paylo
 
 
 def cmd_ls(args, ctx: Ctx) -> int:
+    labels = list(args.label or [])
+    if args.pipeline:
+        labels.append(f"pipeline={args.pipeline}")
+    if args.phase:
+        labels.append(f"phase={args.phase}")
+    # A pipeline filter (sugar or explicit) means every listed run shares it, so
+    # render swaps the label cell for a phase column.
+    pipeline = args.pipeline
+    if pipeline is None:
+        for raw in args.label or []:
+            if raw.startswith("pipeline="):
+                pipeline = raw.split("=", 1)[1]
+                break
     fetch_limit = 100_000 if (args.all or args.session) else args.n
     items = ctx.client.list_runs(
-        status=args.status, limit=fetch_limit, session=args.session
+        status=args.status, limit=fetch_limit, session=args.session,
+        labels=labels or None,
     )
     if not args.all:
         items = items[: args.n]
     return _tabular(
-        ctx, args, items, lambda: render.ls_rows(items, ctx.now), json_payload=items
+        ctx, args, items,
+        lambda: render.ls_rows(items, ctx.now, pipeline=pipeline),
+        json_payload=items,
     )
 
 
@@ -257,6 +273,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--all", action="store_true", help="all runs, no row cap")
     p_ls.add_argument("--status", default=None, help="filter by raw meta status")
     p_ls.add_argument("--session", default=None, help="filter by session id")
+    p_ls.add_argument("--label", action="append", default=None, metavar="k=v",
+                      help="filter by label (repeatable, AND)")
+    p_ls.add_argument("--pipeline", default=None, help="sugar for --label pipeline=X")
+    p_ls.add_argument("--phase", default=None, help="sugar for --label phase=Y")
     p_ls.set_defaults(func=cmd_ls)
 
     p_show = sub.add_parser("show", parents=[view_parent], help="one run, digested")

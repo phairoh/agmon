@@ -296,25 +296,48 @@ def project_json(objects: list[dict], fields: list[str]) -> list[dict]:
 LS_HEADERS = ["id", "status", "started", "dur", "project", "activity", "issues", "cost"]
 
 
-def ls_rows(items: list[dict], now: datetime | None = None) -> tuple[list[str], list[list]]:
+def labels_cell(labels: dict | None) -> str:
+    """Compact ``k=v,k=v`` rendering of a run's labels, keys sorted; blank when
+    the run has none (no noise for the common unlabeled case)."""
+    if not labels:
+        return ""
+    return ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
+
+
+def ls_rows(
+    items: list[dict], now: datetime | None = None, *, pipeline: str | None = None
+) -> tuple[list[str], list[list]]:
+    """The fleet table. When a ``pipeline`` filter is active (every listed run
+    shares it) a ``phase`` column replaces label noise; otherwise a compact
+    ``labels`` column appears only if some run is labeled."""
+    show_labels = pipeline is None and any(it.get("labels") for it in items)
+    headers = list(LS_HEADERS)
+    if pipeline is not None:
+        headers.insert(4, "phase")  # between dur and project
+    if show_labels:
+        headers.append("labels")
+
     rows = []
     for it in items:
         eff = it.get("effective_status") or "?"
         issues = it.get("issue_count") or 0
         dur = _duration_secs(it.get("started_at"), it.get("ended_at"), now)
-        rows.append(
-            [
-                short_id(it.get("run_id")),
-                Styled(eff, STATUS_STYLES.get(eff, "")),
-                relative_time(it.get("started_at"), now),
-                format_duration(dur),
-                project_basename(it.get("cwd")),
-                it.get("last_event_type") or "-",
-                Styled(str(issues), "red" if issues else "dim"),
-                format_cost(it.get("total_cost_usd")),
-            ]
-        )
-    return LS_HEADERS, rows
+        row = [
+            short_id(it.get("run_id")),
+            Styled(eff, STATUS_STYLES.get(eff, "")),
+            relative_time(it.get("started_at"), now),
+            format_duration(dur),
+            project_basename(it.get("cwd")),
+            it.get("last_event_type") or "-",
+            Styled(str(issues), "red" if issues else "dim"),
+            format_cost(it.get("total_cost_usd")),
+        ]
+        if pipeline is not None:
+            row.insert(4, (it.get("labels") or {}).get("phase") or "-")
+        if show_labels:
+            row.append(labels_cell(it.get("labels")))
+        rows.append(row)
+    return headers, rows
 
 
 # -- events ------------------------------------------------------------------
@@ -383,6 +406,37 @@ def _kv(label: str, value: str) -> Text:
     return t
 
 
+def _pipeline_renderables(lineage: dict | None, now: datetime | None) -> list:
+    """The **Pipeline** section for ``show`` (empty when the run has no pipeline
+    lineage). Named and grouped so it reads as a different relation from the
+    resume-chain lines above it."""
+    if not lineage:
+        return []
+    out: list = [Text("\nPipeline", style="bold")]
+    out.append(_kv("pipeline", str(lineage.get("pipeline") or "-")))
+    out.append(_kv("phase", str(lineage.get("phase") or "-")))
+    if lineage.get("parent"):
+        out.append(Text.assemble(("   parent: ", "dim"), (short_id(lineage["parent"]), "magenta")))
+    for child in lineage.get("children", []):
+        out.append(Text.assemble(("    child: ", "dim"), (short_id(child), "magenta")))
+    siblings = lineage.get("siblings") or []
+    if siblings:
+        headers = ["id", "phase", "status", "started"]
+        rows = []
+        for s in siblings:
+            eff = s.get("effective_status") or "?"
+            rows.append(
+                [
+                    short_id(s.get("run_id")),
+                    s.get("phase") or "-",
+                    Styled(eff, STATUS_STYLES.get(eff, "")),
+                    relative_time(s.get("started_at"), now),
+                ]
+            )
+        out.append(to_table(headers, rows, title="siblings"))
+    return out
+
+
 def show_renderables(
     summary: dict,
     lineage: dict,
@@ -422,11 +476,14 @@ def show_renderables(
     out.append(_kv("cwd", str(run.get("cwd") or "-")))
     out.append(_kv("branch", str(run.get("git_branch") or "-")))
 
-    # lineage
+    # resume-chain lineage (session_id) — distinct from pipeline lineage below.
     if lineage.get("resumed_from"):
         out.append(Text.assemble(("  resumed from ", "dim"), (lineage["resumed_from"], "cyan")))
     for child in lineage.get("resumed_by", []):
         out.append(Text.assemble(("  resumed by ", "dim"), (child, "cyan")))
+
+    # pipeline lineage (labels) — a different relation; kept clearly separate.
+    out.extend(_pipeline_renderables(summary.get("lineage"), now))
 
     # prompt
     prompt = run.get("prompt") or ""
