@@ -885,6 +885,11 @@ against a canned payload."
 (define-derived-mode agmon-list-mode tabulated-list-mode "Agmon"
   "Major mode for browsing the agmon run fleet.
 
+Each row is one run; the list auto-refreshes while a window shows it.
+RET opens the run at point, t tails it live, J shows its raw JSON, and
+$ opens the fleet cost rollup.  g refreshes now, q buries the buffer,
+and ? shows this help.
+
 \\{agmon-list-mode-map}"
   ;; Both the column format and each row's cells are built from the single
   ;; list `agmon-list-columns' (see `agmon--list-format' / `agmon--run-entry'),
@@ -926,6 +931,14 @@ against a canned payload."
 
 ;; `$' opens the fleet-wide cost rollup (a separate screen, not per-run).
 (keymap-set agmon-list-mode-map "$" #'agmon-costs)
+
+;; `?' shows the mode help (the standard `C-h m' view); handy in a
+;; read-only buffer where `?' is otherwise unused.
+(keymap-set agmon-list-mode-map "?" #'describe-mode)
+
+;; Reserved, intentionally unbound: `k' (kill), `r' (resume), `d'
+;; (dispatch) belong to run control, which stage 4 owns.  Leave them
+;; free here so those verbs land consistently across the fleet later.
 
 (defvar-local agmon--list-labels nil
   "Label filters (\"key=value\" strings) active in this list buffer, or nil.
@@ -1004,17 +1017,17 @@ knows what to re-fetch.")
 
 (defvar-local agmon--detail-summary nil
   "Cached parsed /summary for this detail buffer.
-`g' refreshes it from the server; the `TAB' issues toggle re-renders
+`g' refreshes it from the server; the `RET' issues toggle re-renders
 from this cache without a network round-trip.")
 
 (defvar-local agmon--detail-show-issues nil
   "Non-nil when this buffer expands the per-issue detail.
-Buffer-local and off by default -- issues are usually routine.  `TAB'
-flips it.")
+Buffer-local and off by default -- issues are usually routine.  `RET'
+on the Issues heading flips it.")
 
 (defvar-local agmon--detail-runs nil
   "Cached run list for this detail buffer, used to derive session lineage.
-Fetched alongside the summary; a re-render (e.g. the `TAB' toggle) reuses
+Fetched alongside the summary; a re-render (e.g. the `RET' toggle) reuses
 it without another round-trip.")
 
 ;; `q' (bury) and `g' (revert) are inherited from `special-mode'.  RET
@@ -1026,10 +1039,16 @@ it without another round-trip.")
   :doc "Keymap for `agmon-detail-mode'."
   "J" #'agmon-show-json
   "RET" #'agmon-detail-follow
-  "t" #'agmon-tail)
+  "t" #'agmon-tail
+  "?" #'describe-mode)
 
 (define-derived-mode agmon-detail-mode special-mode "Agmon-Detail"
   "Major mode for a single run's detail view.
+
+RET acts on whatever is at point -- follows a lineage/pipeline link, or
+folds the Issues section when point is on its heading (the ▸/▾ marker).
+t tails this run, J shows its raw JSON, g refreshes, q buries, and ?
+shows this help.
 
 \\{agmon-detail-mode-map}"
   ;; `g' runs `revert-buffer', which delegates to this function; we
@@ -1138,7 +1157,8 @@ Buffer-local, so `g' knows what to re-fetch.")
 (defvar-keymap agmon-json-mode-map
   :doc "Keymap for `agmon-json-mode'."
   "q" #'quit-window
-  "g" #'revert-buffer)
+  "g" #'revert-buffer
+  "?" #'describe-mode)
 
 (defun agmon--json-parent-mode ()
   "Enable the best available JSON major mode in the current buffer.
@@ -1151,7 +1171,7 @@ JSON buffer without reloading agmon."
 (define-derived-mode agmon-json-mode agmon--json-parent-mode "Agmon-JSON"
   "Major mode for agmon's raw-JSON escape hatch.
 A read-only, syntax-highlighted view of a run's /summary payload; `q'
-buries it and `g' re-fetches."
+buries it, `g' re-fetches, and `?' shows this help."
   ;; Advertise which backend won; \"[ts]\" also confirms a grammar install.
   (when (treesit-ready-p 'json t)
     (setq mode-name "Agmon-JSON[ts]"))
@@ -1458,10 +1478,16 @@ PROGRESS line and no tool call -- the kind worth folding open."
   :doc "Keymap for `agmon-tail-mode'."
   "a" #'agmon-tail-toggle-all
   "TAB" #'agmon-tail-toggle-line
-  "<tab>" #'agmon-tail-toggle-line)
+  "<tab>" #'agmon-tail-toggle-line
+  "?" #'describe-mode)
 
 (define-derived-mode agmon-tail-mode special-mode "Agmon-Tail"
   "Major mode for a live event tail of one run.
+
+Each line is one event, rendered as an editorial summary; the tail polls
+while visible and stops at a terminal status.  TAB folds the assistant
+prose on the line at point (the ▸/▾ marker), a toggles the low-value
+event types, g refreshes, q buries, and ? shows this help.
 
 \\{agmon-tail-mode-map}"
   (setq-local revert-buffer-function #'agmon--tail-revert)
@@ -1758,6 +1784,10 @@ Installed on `tabulated-list-revert-hook', so \\[revert-buffer] refreshes."
 (define-derived-mode agmon-costs-mode tabulated-list-mode "Agmon-Costs"
   "Major mode for the agmon cost rollup: a daily cost/turns/run-count table.
 
+One row per day, newest first, with a pinned TOTAL row; column headers
+sort, o restores the default sort, g re-fetches, q buries, and ? shows
+this help.
+
 \\{agmon-costs-mode-map}"
   (setq tabulated-list-format (agmon--costs-format))
   ;; Newest day first; the `t' flips the numeric Date sort to descending.
@@ -1776,6 +1806,7 @@ Installed on `tabulated-list-revert-hook', so \\[revert-buffer] refreshes."
 ;; `o' restores the default sort after a column-header click, mirroring the
 ;; run list.  (`g' revert and `q' bury come from `tabulated-list-mode'.)
 (keymap-set agmon-costs-mode-map "o" #'agmon-costs-sort-default)
+(keymap-set agmon-costs-mode-map "?" #'describe-mode)
 
 ;;;###autoload
 (defun agmon-costs ()
