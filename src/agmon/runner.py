@@ -26,6 +26,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .labels import build_labels
+
 RUNS_DIR = Path(os.environ.get("AGENT_RUNS_DIR", "~/agent-runs")).expanduser()
 
 
@@ -94,11 +96,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip auto-discovery of hooks/skills/MCP/CLAUDE.md (CI-style runs)",
     )
+    ap.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="stamp a label (repeatable); keys [a-z0-9_.-]{1,64}, values "
+        "non-empty printable ≤256 chars, ≤16 labels, no duplicate keys",
+    )
+    ap.add_argument("--pipeline", default=None, help="sugar for --label pipeline=X")
+    ap.add_argument("--phase", default=None, help="sugar for --label phase=Y")
+    ap.add_argument("--parent", default=None, metavar="RUN_ID",
+                    help="sugar for --label parent=RUN_ID")
     return ap
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+
+    try:
+        labels = build_labels(
+            args.label, pipeline=args.pipeline, phase=args.phase, parent=args.parent
+        )
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
 
     prompt = args.prompt
     if prompt.startswith("@"):
@@ -156,6 +177,7 @@ def main(argv: list[str] | None = None) -> None:
         "result_subtype": None,     # success | error_max_turns | error_during_execution | ...
         "num_turns": None,
         "total_cost_usd": None,
+        "labels": labels,          # flat key=value facts; meaning lives in derivation
     }
 
     try:

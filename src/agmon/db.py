@@ -12,7 +12,7 @@ from pathlib import Path
 # Bump this whenever the schema changes. Migrations are drop-and-replay: on a
 # version mismatch the db file is deleted and the whole spool re-ingested (the
 # spool is the source of truth, the db a disposable index). See init_db.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS ingest_state (
   byte_off   INTEGER NOT NULL,
   meta_mtime REAL
 );
+
+-- Flat key=value labels stamped at dispatch, re-derived from meta.json on every
+-- upsert. Meaning (pipeline/phase/parent lineage) is a derivation-layer concern;
+-- this table stays a plain string->string store. The (key, value) index serves
+-- label= filters and the sibling/children lineage lookups.
+CREATE TABLE IF NOT EXISTS run_labels (
+  run_id TEXT NOT NULL,
+  key    TEXT NOT NULL,
+  value  TEXT NOT NULL,
+  PRIMARY KEY (run_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_labels_kv ON run_labels (key, value);
 """
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import db
 from .config import Config
+from .labels import validate_label
 
 log = logging.getLogger("agmon.ingest")
 
@@ -53,6 +54,29 @@ def _run_row(data: dict) -> dict:
 
 def _as_str_or_none(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _label_rows(run_id: str, data: dict) -> list[tuple[str, str, str]]:
+    """Well-formed (run_id, key, value) rows from a meta.json ``labels`` object.
+
+    Lenient by design (the wrapper is the strict gate): a non-object ``labels``
+    or any entry that violates the constraints is skipped with a log line, so a
+    foreign or buggy writer can never stall the file — per the containment
+    invariant."""
+    labels = data.get("labels")
+    if labels is None:
+        return []
+    if not isinstance(labels, dict):
+        log.warning("run %s: ignoring non-object labels", run_id)
+        return []
+    rows = []
+    for key, value in labels.items():
+        err = validate_label(key, value)
+        if err is not None:
+            log.warning("run %s: skipping label — %s", run_id, err)
+            continue
+        rows.append((run_id, key, value))
+    return rows
 
 
 def _blocks(obj: dict) -> list:
@@ -164,12 +188,21 @@ class Ingester:
         cols = list(row.keys())
         placeholders = ",".join("?" * len(cols))
         updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "run_id")
+        label_rows = _label_rows(run_id, data)
         with self.conn:
             self.conn.execute(
                 f"INSERT INTO runs ({','.join(cols)}) VALUES ({placeholders}) "
                 f"ON CONFLICT(run_id) DO UPDATE SET {updates}",
                 [row[c] for c in cols],
             )
+            # Labels are dispatch-time facts, but meta.json is rewritten as the
+            # run progresses; re-derive them idempotently from the current file.
+            self.conn.execute("DELETE FROM run_labels WHERE run_id=?", (run_id,))
+            if label_rows:
+                self.conn.executemany(
+                    "INSERT INTO run_labels (run_id, key, value) VALUES (?, ?, ?)",
+                    label_rows,
+                )
             self.conn.execute(
                 "INSERT INTO ingest_state (path, run_id, byte_off, meta_mtime) "
                 "VALUES (?, ?, 0, ?) "
