@@ -31,6 +31,8 @@
 (require 'subr-x)
 (require 'iso8601)
 (require 'seq)
+(require 'json)
+(require 'js)
 
 ;;;; Customization
 
@@ -136,18 +138,22 @@ for wide frames, lower it for narrow ones."
 ;; both JSON null and false become nil.  This lets us reach into payloads
 ;; with `let-alist' / `alist-get' and walk arrays with `mapcar'/`dolist'.
 
-(defun agmon--request (path)
-  "Perform a synchronous GET of PATH and return the parsed JSON body.
+(defun agmon--request (path &optional raw)
+  "Perform a synchronous GET of PATH and return the JSON body.
 PATH is a route beginning with a slash, e.g. \"/v1/runs\"; it is
-appended to `agmon-url'.  See the commentary above for the JSON
-representation.  Signals a `plz-error' if the request fails."
+appended to `agmon-url'.  By default the body is parsed per the JSON
+representation above; with RAW non-nil it is returned verbatim as a
+string (for the raw-JSON escape hatch).  Signals a `plz-error' if the
+request fails."
   (let ((url (concat (string-remove-suffix "/" agmon-url) path)))
     (plz 'get url
-      :as (lambda ()
-            (json-parse-buffer :object-type 'alist
-                               :array-type 'list
-                               :null-object nil
-                               :false-object nil)))))
+      :as (if raw
+              'string
+            (lambda ()
+              (json-parse-buffer :object-type 'alist
+                                 :array-type 'list
+                                 :null-object nil
+                                 :false-object nil))))))
 
 (defun agmon--runs (&optional status limit)
   "Fetch the run list as a list of alists, newest first.
@@ -604,6 +610,9 @@ against a canned payload."
 ;; in the operator's config; see the package README.)
 (keymap-set agmon-list-mode-map "RET" #'agmon-show-run)
 
+;; `J' shows the raw /summary JSON for the run at point.
+(keymap-set agmon-list-mode-map "J" #'agmon-show-json)
+
 (defun agmon--list-refresh ()
   "Re-fetch the run list into `tabulated-list-entries'.
 Installed on `tabulated-list-revert-hook', so `g' refreshes."
@@ -640,7 +649,8 @@ flips it.")
 (defvar-keymap agmon-detail-mode-map
   :doc "Keymap for `agmon-detail-mode'."
   "TAB" #'agmon-detail-toggle-issues
-  "<tab>" #'agmon-detail-toggle-issues)
+  "<tab>" #'agmon-detail-toggle-issues
+  "J" #'agmon-show-json)
 
 (define-derived-mode agmon-detail-mode special-mode "Agmon-Detail"
   "Major mode for a single run's detail view.
@@ -707,6 +717,70 @@ right-hand side window so the list stays visible."
   (let ((id (or run-id (tabulated-list-get-id))))
     (unless id (user-error "No run at point"))
     (agmon--open-detail id side)))
+
+;;;; Raw-JSON escape hatch
+;;
+;; `J' anywhere in agmon shows the run at point's /summary as
+;; pretty-printed JSON -- the CLI's `--json' reborn as a keybinding, for
+;; when the rendered view hides something you need to see.  It derives
+;; from `js-json-mode' for syntax highlighting (regexp-based, so no
+;; tree-sitter grammar required) and adds a read-only, `q'-to-bury view;
+;; unlike a `special-mode' buffer that means evil users bind `q'/`g'
+;; explicitly (see the README).
+
+(defvar-local agmon--json-run-id nil
+  "Run id whose raw /summary this JSON buffer shows.
+Buffer-local, so `g' knows what to re-fetch.")
+
+(defvar-keymap agmon-json-mode-map
+  :doc "Keymap for `agmon-json-mode'."
+  "q" #'quit-window
+  "g" #'revert-buffer)
+
+(define-derived-mode agmon-json-mode js-json-mode "Agmon-JSON"
+  "Major mode for agmon's raw-JSON escape hatch.
+A read-only, syntax-highlighted view of a run's /summary payload; `q'
+buries it and `g' re-fetches."
+  (setq buffer-read-only t)
+  (setq-local revert-buffer-function #'agmon--json-revert))
+
+(defun agmon--json-revert (&rest _)
+  "Re-fetch and redraw this JSON buffer.
+Installed as the buffer-local `revert-buffer-function'.  Ignores its
+arguments."
+  (agmon--json-render))
+
+(defun agmon--json-render ()
+  "Fetch this buffer's run summary as raw JSON and pretty-print it."
+  (let ((raw (agmon--request
+              (format "/v1/runs/%s/summary" agmon--json-run-id) t))
+        (inhibit-read-only t))
+    (erase-buffer)
+    (insert raw)
+    (json-pretty-print-buffer)
+    (goto-char (point-min))))
+
+(defun agmon--run-id-at-point ()
+  "Return the run id the current buffer or point refers to, or nil.
+A detail buffer answers with its own run; the list answers with the
+row at point."
+  (or agmon--detail-run-id
+      (and (derived-mode-p 'tabulated-list-mode) (tabulated-list-get-id))))
+
+(defun agmon-show-json ()
+  "Show the pretty-printed raw /summary JSON for the run at point.
+Works from the run list (the row at point) and from a detail buffer
+\(its run).  The buffer is read-only; `q' buries it."
+  (interactive)
+  (let ((id (agmon--run-id-at-point)))
+    (unless id (user-error "No run at point"))
+    (let ((buf (get-buffer-create
+                (format "*agmon-json: %s*" (agmon--short-id id)))))
+      (with-current-buffer buf
+        (agmon-json-mode)
+        (setq agmon--json-run-id id)
+        (agmon--json-render))
+      (pop-to-buffer buf))))
 
 ;;;###autoload
 (defun agmon ()
