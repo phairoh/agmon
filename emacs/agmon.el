@@ -611,8 +611,10 @@ against a canned payload."
             lines)
       (push "" lines)
       ;; Aligned label/value block -- one field per line, labels dimmed.
+      ;; The full run id leads (the header only shows the short id).
       (dolist (field (delq nil
-                           (list (agmon--detail-field "Path" .run.cwd)
+                           (list (agmon--detail-field "Run" .run.run_id)
+                                 (agmon--detail-field "Path" .run.cwd)
                                  (agmon--detail-field "Git" git)
                                  (agmon--detail-field "Host" .run.host)
                                  (agmon--detail-field "Started" started-str)
