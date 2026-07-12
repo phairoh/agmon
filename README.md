@@ -27,6 +27,38 @@ the db file (and its `-wal`/`-shm` sidecars) and recreates it empty — which
 resets all ingest offsets, so the next scan re-ingests the entire spool from
 scratch. There is no in-place migration path; never hand-edit the db.
 
+### The spool contract: labels
+
+`agmon run` stamps arbitrary **labels** into `<run_id>.meta.json` under a
+top-level `"labels"` object (an empty object when none) — flat string→string
+facts, decided at dispatch:
+
+```json
+{ "run_id": "...", "labels": { "pipeline": "nightly", "phase": "build" } }
+```
+
+Labels are the only relation the spool contract knows about; all *meaning*
+(pipelines, phases, parent/child edges) lives in the derivation layer, never in
+the spool. Constraints, so a foreign writer can participate:
+
+- keys match `[a-z0-9_.-]{1,64}`;
+- values are non-empty printable strings (spaces allowed, no control
+  characters), ≤256 chars;
+- at most 16 labels per run; keys are unique.
+
+The wrapper enforces these strictly (a bad `--label` never launches). The
+ingester is lenient: a foreign or buggy meta.json with a malformed entry has
+that entry skipped with a log line — it never fails the file.
+
+Three keys are **reserved by convention** (still stored as ordinary labels):
+`pipeline` (a grouping id), `phase` (conventionally `spec`/`build`/`review`/
+`consolidate`, but any value renders — no vocabulary or ordering is enforced),
+and `parent` (a run_id, the causal edge). Derivation reads these to build the
+`lineage` block in a run summary: the run's pipeline/phase/parent plus its
+`children` (runs whose `parent` names it) and `siblings` (runs sharing its
+`pipeline`). This pipeline lineage is distinct from resume-chain lineage
+(shared `session_id`); the two are never conflated.
+
 ## Requirements
 
 - Python 3.12+
@@ -86,13 +118,25 @@ prints the version.
 ```sh
 agmon ls                        # fleet glance, newest first (-n N, --all)
 agmon ls --status running       # filter by raw status (also --session <sid>)
+agmon ls --pipeline nightly     # label filter (also --phase Y, --label k=v ×N)
 agmon show a3f9                 # one run, digested (--full-prompt, --raw)
 agmon tail                      # live-follow the latest run (--last N)
 agmon events a3f9 --errors-only     # forensics table (--type, --after, -n)
 agmon costs --days 7            # cost/turn rollup (--since/--until)
 agmon serve --port 8400         # start the server (--host/--port override env)
 agmon run @task.md --cwd ~/src/proj    # launch + spool a run, prints run_id
+agmon run @build.md --pipeline nightly --phase build --parent $spec_id  # a labeled phase run
 ```
+
+`agmon ls` takes repeatable `--label k=v` filters (AND), with `--pipeline X` and
+`--phase Y` as sugar. When a pipeline filter is active every listed run shares
+it, so the table swaps in a `phase` column; otherwise a compact `labels` cell
+appears only for the runs that carry labels. `agmon show` prints a **Pipeline**
+section (id, phase, parent/children, a sibling table) whenever a run has
+pipeline lineage — kept visually separate from the resume-chain lines so the two
+relations don't read as one. `agmon run` accepts `--label KEY=VALUE`
+(repeatable) plus the `--pipeline`/`--phase`/`--parent` sugar (see the spool
+contract above for constraints).
 
 `agmon tail` is scriptable — it exits `0` on a finished run, `1` on error, and
 `3` if the run died — so `agmon tail $id && next-thing` works. Fields are
@@ -152,25 +196,30 @@ curl -s localhost:8400/healthz
 # {"ok":true,"runs_dir":"/home/you/agent-runs","db":"...","last_scan_at":"2026-07-08T...","runs_tracked":3}
 ```
 
-### `GET /v1/runs?status=<s>&limit=<n>`
+### `GET /v1/runs?status=<s>&limit=<n>&label=<k=v>`
 
 Newest first by `started_at` (default `limit=50`). Each item carries the run
 columns plus `prompt_preview` (first 120 chars), `event_count`,
 `last_event_at`, `last_event_type`, `pid_alive`, `effective_status`,
-`stalled_seconds`, and `issue_count` (a count of error-flagged events). `status`
-here filters on the raw meta status, not `effective_status`. `pid_alive` is
-computed at request time (`os.kill(pid, 0)`) only for `running` runs with a
-pid, else null.
+`stalled_seconds`, `issue_count` (a count of error-flagged events), and a
+`labels` object (empty when the run has none). `status` here filters on the raw
+meta status, not `effective_status`. `pid_alive` is computed at request time
+(`os.kill(pid, 0)`) only for `running` runs with a pid, else null.
+
+`label=key=value` is a repeatable filter with **AND** semantics — a run must
+carry every requested label to match. Malformed filter syntax (no `=`, empty
+key) returns 400.
 
 ```sh
 curl -s "localhost:8400/v1/runs?status=running&limit=10"
+curl -s "localhost:8400/v1/runs?label=pipeline=nightly&label=phase=build"
 ```
 
 ### `GET /v1/runs/{run_id}`
 
-Full run row including `prompt` and the parsed `meta_json` (everything from the
-spool `.meta.json`, including fields not columnized), plus the same computed
-fields. 404 with `{"error": "..."}` for an unknown id.
+Full run row including `prompt`, the `labels` object, and the parsed `meta_json`
+(everything from the spool `.meta.json`, including fields not columnized), plus
+the same computed fields. 404 with `{"error": "..."}` for an unknown id.
 
 ```sh
 curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
@@ -179,13 +228,31 @@ curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
 ### `GET /v1/runs/{run_id}/summary`
 
 The full picture for one run: `{run, status, activity, issues, metrics,
-result_text}`. `status` is the derived status block above; `activity` is
-`{last_tool, last_text, progress}`; `issues` is the most recent 50 error-flagged
-tool_results and non-success results (`{seq, category, tool, snippet}`, where
-`category` is `permission` / `tool_error` / `run_error`); `metrics` is
-`{num_events, tool_counts, duration_seconds, num_turns, total_cost_usd,
-usage}`; `result_text` is the full `result` string from the run's result event
-(null if absent). All events for the run are loaded per request (no caching).
+result_text, lineage}`. `status` is the derived status block above; `activity`
+is `{last_tool, last_text, progress}`; `issues` is the most recent 50
+error-flagged tool_results and non-success results (`{seq, category, tool,
+snippet}`, where `category` is `permission` / `tool_error` / `run_error`);
+`metrics` is `{num_events, tool_counts, duration_seconds, num_turns,
+total_cost_usd, usage}`; `result_text` is the full `result` string from the
+run's result event (null if absent). `run.labels` carries the run's labels.
+All events for the run are loaded per request (no caching).
+
+`lineage` is the pipeline-lineage block derived from the reserved labels, or
+`null` when the run carries none of them:
+
+```json
+"lineage": {
+  "pipeline": "nightly", "phase": "build", "parent": "<run_id>",
+  "children": ["<run_id>", ...],
+  "siblings": [{"run_id": "...", "phase": "spec", "effective_status": "finished", "started_at": "..."}]
+}
+```
+
+`children` are runs whose `parent` label names this run; `siblings` are the
+other runs sharing this run's `pipeline` (oldest first). `parent` is surfaced as
+labeled — a `parent` naming a run that does not exist is rendered as-is, not
+validated. This is **distinct** from the resume-chain lineage (shared
+`session_id`); a run may have both.
 
 ```sh
 curl -s localhost:8400/v1/runs/20260708T174951-67a5e8/summary
@@ -227,8 +294,9 @@ line matching `^PROGRESS: (.+)$`. The most recent such line is returned as
 src/agmon/
   config.py    # env-var configuration
   db.py        # schema + connection helpers, drop-and-replay migration
+  labels.py    # label constraints — the spool primitive (strict wrapper, lenient ingest)
   ingest.py    # background scanner (the only writer)
-  derive.py    # pure derivation functions (status/activity/issues/metrics/result)
+  derive.py    # pure derivation functions (status/activity/issues/metrics/result/lineage)
   api.py       # FastAPI app + endpoints
   client.py    # pure HTTP client + id resolution + lineage (no printing)
   render.py    # all CLI formatting (tables/TSV/event compaction; no I/O)

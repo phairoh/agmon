@@ -24,6 +24,14 @@ Code and README are authoritative; this file is memory, not spec.
   no sqlite3/fastapi/os imports, so tests drive them with plain dicts).
 - Bump the schema version whenever ingest-time derivation logic changes, not
   only the schema shape — stale classification is a silent index corruption.
+- Labels are flat string→string facts in the spool (`meta.json` `labels`,
+  table `run_labels`); all meaning — pipeline, phase, parent lineage — lives in
+  derivation (`derive.derive_lineage`), read from reserved keys. Never add
+  pipeline/phase/parent columns or fields to the spool contract; that inversion
+  is deliberate. The wrapper (`labels.build_labels`) enforces the constraints
+  strictly; the ingester (`_label_rows`) applies them leniently (skip + log a
+  bad entry, never stall the file). Pipeline lineage is distinct from
+  resume-chain lineage (`session_id`); never conflate them in output.
 
 `effective_status` (derived in `derive.derive_status`, not stored): `finished`,
 `error` (task failed — meta `error` + non-null `result_subtype`), `interrupted`
