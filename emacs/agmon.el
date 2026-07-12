@@ -469,10 +469,66 @@ Returns nil when VALUE is empty, so callers can `delq' it out."
     (concat (propertize (format "%-9s" label) 'face 'agmon-detail-label)
             value)))
 
-(defun agmon--render-summary (summary now show-issues)
+(defun agmon--lineage (run-id session-id runs)
+  "Return (FROM . BY), a session's siblings split around RUN-ID.
+FROM are runs in RUNS sharing SESSION-ID that started before RUN-ID (the
+runs it was resumed from); BY are those that started after (the runs that
+resumed it), each a run alist ordered by start time.  Nil when SESSION-ID
+is nil.  Pure."
+  (when session-id
+    (let* ((sibs (seq-filter
+                  (lambda (r) (equal (alist-get 'session_id r) session-id))
+                  runs))
+           (sorted (sort sibs
+                         (lambda (a b)
+                           (string< (or (alist-get 'started_at a) "")
+                                    (or (alist-get 'started_at b) "")))))
+           (seen nil) (from nil) (by nil))
+      (dolist (r sorted)
+        (cond ((equal (alist-get 'run_id r) run-id) (setq seen t))
+              (seen (push r by))
+              (t (push r from))))
+      (cons (nreverse from) (nreverse by)))))
+
+(defvar-keymap agmon--lineage-map
+  :doc "Keymap carried on a detail-buffer lineage line, for mouse activation."
+  "<mouse-1>" #'agmon-detail-follow
+  "<mouse-2>" #'agmon-detail-follow)
+
+(defun agmon--lineage-line (label run now)
+  "Format one lineage RUN as a LABEL row for the detail buffer, as of NOW.
+LABEL is \"resumed from\" or \"resumed by\".  The whole row carries the
+run's id as an `agmon-run-id' text property (and a mouse keymap), so
+`agmon-detail-follow' -- on RET or a click -- opens that run; the id
+itself wears the `link' face as an affordance."
+  (let-alist run
+    (let* ((status (or .effective_status ""))
+           (start (agmon--parse-time .started_at))
+           (line (concat
+                  "  "
+                  (propertize (format "%-13s" label) 'face 'agmon-detail-label)
+                  (propertize (agmon--short-id .run_id) 'face 'link)
+                  "  "
+                  (propertize (format "%-10s" status)
+                              'face (agmon--status-face status))
+                  (if start
+                      (propertize
+                       (format "  %s ago"
+                               (agmon--format-age
+                                (floor (float-time (time-subtract now start)))))
+                       'face 'shadow)
+                    ""))))
+      (propertize line
+                  'agmon-run-id .run_id
+                  'mouse-face 'highlight
+                  'help-echo "mouse-1/RET: open this run"
+                  'keymap agmon--lineage-map))))
+
+(defun agmon--render-summary (summary now show-issues runs)
   "Render SUMMARY, a parsed /summary payload, to a display string as of NOW.
 SHOW-ISSUES non-nil expands the per-issue detail; otherwise only the
-Issues heading shows.  Pure: it takes data and returns a propertized
+Issues heading shows.  RUNS is the run list used to derive session
+lineage (nil to omit it).  Pure: it takes data and returns a propertized
 string, with no network call and no buffer mutation, so ert can diff it
 against a canned payload."
   (let-alist summary
@@ -544,6 +600,15 @@ against a canned payload."
                          (agmon--truncate
                           (agmon--oneline (or (alist-get 'target lt) "")) 70)))
                 lines)))
+      ;; Lineage: other runs sharing this run's session_id (resume chain).
+      (let* ((lin (agmon--lineage .run.run_id .run.session_id runs))
+             (from (car lin))
+             (by (cdr lin)))
+        (when (or from by)
+          (push "" lines)
+          (push (propertize "Lineage" 'face 'agmon-detail-heading) lines)
+          (dolist (r from) (push (agmon--lineage-line "resumed from" r now) lines))
+          (dolist (r by) (push (agmon--lineage-line "resumed by" r now) lines))))
       ;; Issues, collapsed to the heading unless SHOW-ISSUES (they are
       ;; usually the routine \"read before edit\" kind, so hide by default).
       (when .issues
@@ -642,6 +707,11 @@ from this cache without a network round-trip.")
 Buffer-local and off by default -- issues are usually routine.  `TAB'
 flips it.")
 
+(defvar-local agmon--detail-runs nil
+  "Cached run list for this detail buffer, used to derive session lineage.
+Fetched alongside the summary; a re-render (e.g. the `TAB' toggle) reuses
+it without another round-trip.")
+
 ;; `q' (bury) and `g' (revert) are inherited from `special-mode'; we add
 ;; TAB to expand/collapse the issues section.  Bind both spellings: `TAB'
 ;; is the terminal form (C-i), `<tab>' the event a graphical frame's Tab
@@ -650,7 +720,8 @@ flips it.")
   :doc "Keymap for `agmon-detail-mode'."
   "TAB" #'agmon-detail-toggle-issues
   "<tab>" #'agmon-detail-toggle-issues
-  "J" #'agmon-show-json)
+  "J" #'agmon-show-json
+  "RET" #'agmon-detail-follow)
 
 (define-derived-mode agmon-detail-mode special-mode "Agmon-Detail"
   "Major mode for a single run's detail view.
@@ -670,8 +741,10 @@ Ignores its arguments."
   (agmon--detail-fetch))
 
 (defun agmon--detail-fetch ()
-  "Fetch this buffer's run summary into the cache, then redraw."
+  "Fetch this buffer's run summary and the run list, then redraw.
+The run list feeds the session-lineage section."
   (setq agmon--detail-summary (agmon--summary agmon--detail-run-id))
+  (setq agmon--detail-runs (agmon--runs))
   (agmon--detail-render))
 
 (defun agmon--detail-render ()
@@ -684,7 +757,8 @@ Ignores its arguments."
     (erase-buffer)
     (insert (agmon--render-summary agmon--detail-summary
                                    (current-time)
-                                   agmon--detail-show-issues))
+                                   agmon--detail-show-issues
+                                   agmon--detail-runs))
     (goto-char (min p (point-max)))))
 
 (defun agmon-detail-toggle-issues ()
@@ -692,6 +766,19 @@ Ignores its arguments."
   (interactive)
   (setq agmon--detail-show-issues (not agmon--detail-show-issues))
   (agmon--detail-render))
+
+(defun agmon-detail-follow (&optional event)
+  "Open the detail buffer for the lineage run at point.
+On a mouse EVENT use the click position, otherwise point.  The run id
+rides on the line as an `agmon-run-id' text property (see
+`agmon--lineage-line'); bound to RET and to a mouse click on a lineage
+line."
+  (interactive (list last-nonmenu-event))
+  (let* ((pos (if (mouse-event-p event) (posn-point (event-end event)) (point)))
+         (id (get-text-property pos 'agmon-run-id)))
+    (if id
+        (agmon--open-detail id)
+      (user-error "No run link at point"))))
 
 (defun agmon--open-detail (run-id &optional side)
   "Open, refresh, and select the detail buffer for RUN-ID.
