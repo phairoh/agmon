@@ -26,3 +26,27 @@ remove the xfail marker, fix, delete the entry.
   comparing (persist a `started_at_utc` at ingest, or compare on
   `strftime`-of-a-UTC-normalized value), then filter on that.
 - **Test:** none — hardening entry-only, no real trigger in the spool.
+
+## B2 — HARDENING: ingester does not enforce the 16-label aggregate cap
+
+- **Origin:** from stage-4a review F1.
+- **Severity:** hardening (no incorrect output, stall, or corruption — the
+  `run_labels` PK `(run_id, key)` and the never-stall-the-file invariant both
+  hold; every wrapper-written meta already caps at `MAX_LABELS`, so only a
+  foreign/buggy writer can exceed it).
+- **Where:** `ingest.py:59` `_label_rows` — validates each entry via
+  `validate_label` (per-entry) but never applies `labels.MAX_LABELS`, the
+  per-run aggregate constraint that only `build_labels` (the wrapper) enforces.
+- **Impact:** a foreign `meta.json` with N > 16 well-formed labels lands all N
+  rows (observed: 20 labels → 20 rows). The spool can accumulate more labels
+  per run than the dispatch contract permits. Deliberately deferred: whether
+  the aggregate cap is an ingest-time constraint is ambiguous in spec §2 (the
+  lenient path is built around the per-entry `validate_label`, and CLAUDE.md
+  documents the ingester's model as per-entry leniency); read as a dispatch
+  guard only, so left as a robustness gap for a human decision.
+- **Suggested fix:** after the per-entry loop, truncate to the first
+  `MAX_LABELS` rows (deterministic order) with a single `log.warning` naming
+  the count dropped — mirroring the per-entry skip-and-log, keeping the file
+  non-stalling.
+- **Test:** none — hardening entry-only; behavior is deliberate pending a spec
+  decision, so no strict-xfail is left.
