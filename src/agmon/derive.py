@@ -254,6 +254,64 @@ def derive_result_text(events: list[dict]) -> str | None:
     return text
 
 
+# -- lineage (pipeline conventions over flat labels) -------------------------
+
+# Reserved label keys the derivation layer interprets. The presence of any of
+# them is what makes a run "in a pipeline"; their meaning is a convention, not a
+# spool-contract fact (labels stay flat string->string; see labels.py).
+_RESERVED_KEYS = ("pipeline", "phase", "parent")
+
+
+def derive_lineage(run_id: str, labels: dict, related: list[dict]) -> dict | None:
+    """Pipeline lineage for a run, derived purely from flat labels.
+
+    ``labels`` is this run's label dict. ``related`` is a bounded pool of *other*
+    runs — each ``{"run_id", "labels", "effective_status", "started_at"}`` — that
+    the caller pre-selects (pipeline members plus runs whose ``parent`` points
+    here). From it this derives:
+
+    - ``children``: runs whose ``parent`` label equals ``run_id``;
+    - ``siblings``: runs sharing this run's ``pipeline`` value (self excluded),
+      oldest first.
+
+    ``pipeline``/``phase``/``parent`` are surfaced verbatim from the labels — a
+    ``parent`` naming a run that does not exist is rendered as-is, not validated.
+    Returns ``None`` when the run carries none of the reserved keys, so callers
+    can omit the block entirely. This is distinct from resume-chain lineage
+    (``session_id``); the two must never be conflated.
+    """
+    if not any(k in labels for k in _RESERVED_KEYS):
+        return None
+    pipeline = labels.get("pipeline")
+    children = sorted(
+        {
+            r["run_id"]
+            for r in related
+            if (r.get("labels") or {}).get("parent") == run_id
+        }
+    )
+    siblings = [
+        {
+            "run_id": r["run_id"],
+            "phase": (r.get("labels") or {}).get("phase"),
+            "effective_status": r.get("effective_status"),
+            "started_at": r.get("started_at"),
+        }
+        for r in related
+        if pipeline is not None
+        and (r.get("labels") or {}).get("pipeline") == pipeline
+        and r["run_id"] != run_id
+    ]
+    siblings.sort(key=lambda s: (s.get("started_at") is None, s.get("started_at") or ""))
+    return {
+        "pipeline": pipeline,
+        "phase": labels.get("phase"),
+        "parent": labels.get("parent"),
+        "children": children,
+        "siblings": siblings,
+    }
+
+
 # -- metrics -----------------------------------------------------------------
 
 
