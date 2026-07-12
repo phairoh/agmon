@@ -53,3 +53,14 @@
      build, etc.). This is out of scope for the read-only agmon.el mode
      (spec fences control-plane to stage 4+ / a separate roadmap item) —
      but it is the half that makes the loop "run fully agentically."
+  Follow-on (surface deleted phase artifacts): a phase's key output can
+  be intentionally removed from the repo — REVIEW.md is written by the
+  review phase and consumed+deleted by consolidate (per CLAUDE.md). But
+  the content is NOT gone: it lives in the review run's event stream (the
+  Write/Edit tool calls in the spool). agmon could reconstruct and show
+  the historical REVIEW.md from events as part of the chain view, so you
+  can follow the whole path — spec -> build -> the actual review text ->
+  consolidation — even for artifacts git no longer has. Read-only, pure
+  derivation from events; fits the represent half. Natural extension:
+  human-reviewed chains, where each phase's surfaced artifact gets a
+  person's sign-off recorded on the lineage.
