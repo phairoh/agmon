@@ -33,6 +33,7 @@
 (require 'seq)
 (require 'json)
 (require 'js)
+(require 'url-util)
 
 ;;;; Internal state
 
@@ -210,16 +211,20 @@ half-draw a buffer, so we only message and leave the last good contents
 in place."
   (message "agmon: request to %s failed: %S" path err))
 
-(defun agmon--runs (&optional status limit then)
+(defun agmon--runs (&optional status limit then labels)
   "Fetch the run list as a list of alists, newest first.
-STATUS filters on the raw meta status; LIMIT caps the number of rows.
-Without THEN this is synchronous and returns the list; with THEN it is
-asynchronous and THEN is called with the list.  All are optional and
-passed through to GET /v1/runs."
+STATUS filters on the raw meta status; LIMIT caps the number of rows;
+LABELS is a list of \"key=value\" strings, each sent as a `label=' filter
+\(the server ANDs them).  Without THEN this is synchronous and returns
+the list; with THEN it is asynchronous and THEN is called with the list.
+All are optional and passed through to GET /v1/runs."
   (let* ((query (string-join
                  (delq nil
-                       (list (and status (format "status=%s" status))
-                             (and limit (format "limit=%d" limit))))
+                       (append
+                        (list (and status (format "status=%s" status))
+                              (and limit (format "limit=%d" limit)))
+                        (mapcar (lambda (l) (concat "label=" (url-hexify-string l)))
+                                labels)))
                  "&"))
          (path (concat "/v1/runs"
                        (if (string-empty-p query) "" (concat "?" query)))))
@@ -322,13 +327,28 @@ lexicographic order of their rendered text."
     (cwd    :name "Cwd"    :width 20 :sort t)
     (age    :name "Age"    :width 6  :numeric t :right-align t)
     (cost   :name "Cost"   :width 7  :numeric t :right-align t)
+    (phase  :name "Phase"  :width 11 :sort t)
+    (labels :name "Labels" :width 24)
     (task   :name "Task"   :width 44))
   "Registry of every run-list column, keyed by symbol.
 Each entry is (KEY :name NAME :width W [:sort t] [:numeric t]
 [:right-align t]).  `agmon-list-columns' selects which of these to
 show and in what order; `agmon--run-cell' renders each KEY's cell.
 A `:numeric' column sorts by a stashed number (see
-`agmon--numeric-sorter') rather than by its rendered text.")
+`agmon--numeric-sorter') rather than by its rendered text.
+`phase' and `labels' read a run's labels; a pipeline-filtered list adds
+`phase' automatically (see `agmon-list-pipeline').")
+
+(defun agmon--labels-cell (labels)
+  "Render alist LABELS as a compact \"k=v,k=v\" string, keys sorted; \"\" if none."
+  (if labels
+      (string-join
+       (mapcar (lambda (kv) (format "%s=%s" (car kv) (cdr kv)))
+               (sort (copy-sequence labels)
+                     (lambda (a b) (string< (symbol-name (car a))
+                                            (symbol-name (car b))))))
+       ",")
+    ""))
 
 (defun agmon--run-cell (key run now)
   "Render the cell for column KEY of RUN, as of time NOW.
@@ -347,6 +367,8 @@ carry an invisible `agmon-sort' property holding their raw value."
       ('cost (propertize (agmon--format-cost .total_cost_usd)
                          'agmon-sort (if (numberp .total_cost_usd)
                                          .total_cost_usd 0)))
+      ('phase (or (alist-get 'phase .labels) ""))
+      ('labels (agmon--truncate (agmon--labels-cell .labels) 40))
       ('task (agmon--truncate (agmon--oneline (or .prompt_preview "")) 100))
       (_ ""))))
 
@@ -596,6 +618,19 @@ itself wears the `link' face as an affordance."
   "An indented LABEL/VALUE row for a sub-section heading (Pipeline, Labels)."
   (concat "  " (propertize (format "%-9s" label) 'face 'agmon-detail-label) value))
 
+(defun agmon--pipeline-value-line (pipeline)
+  "Render the clickable pipeline-id row; RET/click lists that pipeline.
+Carries PIPELINE as an `agmon-pipeline' text property that
+`agmon-detail-follow' routes to `agmon-list-pipeline'."
+  (let ((line (concat "  "
+                      (propertize (format "%-9s" "pipeline") 'face 'agmon-detail-label)
+                      (propertize pipeline 'face 'link))))
+    (propertize line
+                'agmon-pipeline pipeline
+                'mouse-face 'highlight
+                'help-echo "mouse-1/RET: list this pipeline"
+                'keymap agmon--lineage-map)))
+
 (defun agmon--pipeline-ref (label run-id &optional phase status)
   "Format a clickable pipeline-lineage reference row for RUN-ID.
 LABEL is the relation (parent/child/sibling); PHASE and STATUS annotate a
@@ -700,7 +735,7 @@ against a canned payload."
         (push "" lines)
         (push (propertize "Pipeline" 'face 'agmon-detail-heading) lines)
         (when (agmon--nonempty .lineage.pipeline)
-          (push (agmon--indent-field "pipeline" .lineage.pipeline) lines))
+          (push (agmon--pipeline-value-line .lineage.pipeline) lines))
         (when (agmon--nonempty .lineage.phase)
           (push (agmon--indent-field "phase" .lineage.phase) lines))
         (when (agmon--nonempty .lineage.parent)
@@ -812,11 +847,18 @@ against a canned payload."
 ;; `t' opens a live event tail for the run at point.
 (keymap-set agmon-list-mode-map "t" #'agmon-tail)
 
+(defvar-local agmon--list-labels nil
+  "Label filters (\"key=value\" strings) active in this list buffer, or nil.
+Threaded into `agmon--runs' by both refresh paths so the buffer shows
+only matching runs; set by `agmon-list-pipeline'.")
+
 (defun agmon--list-refresh ()
   "Re-fetch the run list into `tabulated-list-entries', synchronously.
 Installed on `tabulated-list-revert-hook', so `g' refreshes now (blocking
-on a manual refresh is fine); the timer path uses `agmon--list-auto-refresh'."
-  (setq tabulated-list-entries (agmon--run-entries (agmon--runs))))
+on a manual refresh is fine); the timer path uses `agmon--list-auto-refresh'.
+Honors this buffer's `agmon--list-labels' filter."
+  (setq tabulated-list-entries
+        (agmon--run-entries (agmon--runs nil nil nil agmon--list-labels))))
 
 ;; Auto-refresh: a repeating timer re-fetches the list, but the callback
 ;; runs only when a window actually shows the buffer -- so a buried list
@@ -842,7 +884,8 @@ request failure the last good list stays put."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (setq tabulated-list-entries (agmon--run-entries runs))
-           (tabulated-list-print t)))))))   ; t: keep point-on-id and sort
+           (tabulated-list-print t))))   ; t: keep point-on-id and sort
+     (buffer-local-value 'agmon--list-labels buffer))))
 
 (defun agmon--list-start-timer ()
   "Start this list buffer's repeating auto-refresh timer.
@@ -951,22 +994,24 @@ The run list feeds the session-lineage section."
   (agmon--detail-render))
 
 (defun agmon-detail-follow (&optional event)
-  "Open the detail buffer for the lineage run at point.
-On a mouse EVENT use the click position, otherwise point.  The run id
-rides on the line as an `agmon-run-id' text property (see
-`agmon--lineage-line'); bound to RET and to a mouse click on a lineage
-line."
+  "Follow the link at point: a lineage run's detail, or a pipeline list.
+On a mouse EVENT use the click position, otherwise point.  A run id rides
+on the line as an `agmon-run-id' property (opens its detail); a pipeline
+id as `agmon-pipeline' (opens `agmon-list-pipeline').  Bound to RET and
+to a mouse click on those lines."
   (interactive (list last-nonmenu-event))
   (let* ((win (if (mouse-event-p event) (posn-window (event-end event))
                 (selected-window)))
          (pos (if (mouse-event-p event) (posn-point (event-end event)) (point)))
-         (id (get-text-property pos 'agmon-run-id)))
-    (if id
-        ;; Reuse the current window: a plain window follows same-window, but a
-        ;; side window is dedicated -- reopen in its side slot so it reuses
-        ;; that window instead of spawning a new one.
-        (agmon--open-detail id (and (window-parameter win 'window-side) t))
-      (user-error "No run link at point"))))
+         (id (get-text-property pos 'agmon-run-id))
+         (pipeline (get-text-property pos 'agmon-pipeline)))
+    (cond
+     ;; Reuse the current window: a plain window follows same-window, but a
+     ;; side window is dedicated -- reopen in its side slot so it reuses that
+     ;; window instead of spawning a new one.
+     (id (agmon--open-detail id (and (window-parameter win 'window-side) t)))
+     (pipeline (agmon-list-pipeline pipeline))
+     (t (user-error "No link at point")))))
 
 (defun agmon--open-detail (run-id &optional side)
   "Open, refresh, and select the detail buffer for RUN-ID.
@@ -1559,6 +1604,45 @@ restarts."
   (let ((buf (get-buffer-create "*agmon*")))
     (with-current-buffer buf
       (agmon-list-mode)
+      (agmon--list-refresh)
+      (tabulated-list-print))
+    (pop-to-buffer buf)))
+
+(defun agmon--columns-with-phase (columns)
+  "Return COLUMNS with `phase' added (after `status' if present, else appended)."
+  (cond
+   ((memq 'phase columns) columns)
+   ((memq 'status columns)
+    (mapcan (lambda (c) (if (eq c 'status) (list 'status 'phase) (list c)))
+            columns))
+   (t (append columns '(phase)))))
+
+(defun agmon--read-pipeline ()
+  "Read a pipeline id, completing over the pipelines present in the fleet."
+  (let ((pipelines (delete-dups
+                    (delq nil (mapcar (lambda (r)
+                                        (alist-get 'pipeline (alist-get 'labels r)))
+                                      (agmon--runs))))))
+    (completing-read "Pipeline: " pipelines nil nil)))
+
+;;;###autoload
+(defun agmon-list-pipeline (pipeline)
+  "Open a run list filtered to PIPELINE (the reserved `pipeline' label).
+The list adds a Phase column, shows the filter in its header line, and
+reuses one buffer per pipeline.  Interactively, completes over the
+pipelines currently in the fleet."
+  (interactive (list (agmon--read-pipeline)))
+  (let ((buf (get-buffer-create (format "*agmon: pipeline=%s*" pipeline))))
+    (with-current-buffer buf
+      (agmon-list-mode)
+      (setq-local agmon-list-columns (agmon--columns-with-phase agmon-list-columns))
+      (setq agmon--list-labels (list (format "pipeline=%s" pipeline)))
+      (setq header-line-format
+            (list (propertize " Pipeline: " 'face 'shadow)
+                  (propertize pipeline 'face 'agmon-detail-heading)))
+      ;; Rebuild the header now that the columns include Phase.
+      (setq tabulated-list-format (agmon--list-format))
+      (tabulated-list-init-header)
       (agmon--list-refresh)
       (tabulated-list-print))
     (pop-to-buffer buf)))
