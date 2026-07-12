@@ -82,6 +82,26 @@ for wide frames, lower it for narrow ones."
   :type 'integer
   :group 'agmon)
 
+(defcustom agmon-tail-poll-seconds 2
+  "Seconds between polls of the event tail buffer.
+Like the list, the tail only polls while a window shows it.  The tail
+stops entirely once the run reaches a terminal status."
+  :type 'natnum
+  :group 'agmon)
+
+(defcustom agmon-tail-hidden-types '("system" "rate_limit_event")
+  "Event types the tail hides by default as low-value noise.
+Toggle them on per-buffer with \\<agmon-tail-mode-map>\\[agmon-tail-toggle-all]."
+  :type '(repeat string)
+  :group 'agmon)
+
+(defcustom agmon-tail-line-width 200
+  "Maximum width of a rendered tail line before it is truncated.
+Keeps a single event (e.g. a long tool_result) from wrapping across many
+screen lines.  Set to 0 to never truncate."
+  :type 'natnum
+  :group 'agmon)
+
 ;;;; Faces
 ;;
 ;; One face per effective status, applied to the Status cell.  They inherit
@@ -142,6 +162,10 @@ for wide frames, lower it for narrow ones."
   "Face for Markdown inline code spans in rendered result text."
   :group 'agmon)
 
+(defface agmon-tail-progress '((t :inherit (bold font-lock-keyword-face)))
+  "Face for PROGRESS lines in the event tail -- the bright, watch-for-me line."
+  :group 'agmon)
+
 ;;;; HTTP transport
 ;;
 ;; Every request in this package goes through `agmon--request'.  Nothing
@@ -153,7 +177,7 @@ for wide frames, lower it for narrow ones."
 ;; both JSON null and false become nil.  This lets us reach into payloads
 ;; with `let-alist' / `alist-get' and walk arrays with `mapcar'/`dolist'.
 
-(defun agmon--request (path &optional raw then)
+(defun agmon--request (path &optional raw then else)
   "Perform a GET of PATH and return the JSON body.
 PATH is a route beginning with a slash, e.g. \"/v1/runs\"; it is
 appended to `agmon-url'.  By default the body is parsed per the JSON
@@ -162,9 +186,10 @@ string (for the raw-JSON escape hatch).
 
 Without THEN the request is synchronous: it returns the body and signals
 a `plz-error' on failure.  With THEN it is asynchronous: THEN is called
-with the body when it arrives, failures are reported by
-`agmon--report-request-error' (never by disturbing a buffer), and the
-return value is the underlying process."
+with the body when it arrives, and the return value is the underlying
+process.  ELSE, if given, is called with the `plz-error' on failure;
+otherwise failures are reported by `agmon--report-request-failure' (never
+by disturbing a buffer)."
   (let ((url (concat (string-remove-suffix "/" agmon-url) path))
         (as (if raw
                 'string
@@ -175,10 +200,10 @@ return value is the underlying process."
                                    :false-object nil)))))
     (if then
         (plz 'get url :as as :then then
-          :else (lambda (err) (agmon--report-request-error path err)))
+          :else (or else (lambda (err) (agmon--report-request-failure path err))))
       (plz 'get url :as as))))
 
-(defun agmon--report-request-error (path err)
+(defun agmon--report-request-failure (path err)
   "Report a failed async request to PATH via the echo area.
 ERR is a `plz-error'.  A background refresh must never blank or
 half-draw a buffer, so we only message and leave the last good contents
@@ -203,11 +228,20 @@ passed through to GET /v1/runs."
                         (lambda (data) (funcall then (alist-get 'runs data))))
       (alist-get 'runs (agmon--request path)))))
 
-(defun agmon--summary (run-id)
+(defun agmon--summary (run-id &optional then)
   "Fetch the parsed /summary payload for RUN-ID.
 The reply is a nested alist: `run' (the full record), `status',
-`activity', `issues', `metrics', and `result_text'."
-  (agmon--request (format "/v1/runs/%s/summary" run-id)))
+`activity', `issues', `metrics', and `result_text'.  Without THEN this
+is synchronous and returns the payload; with THEN it is asynchronous and
+THEN is called with it."
+  (agmon--request (format "/v1/runs/%s/summary" run-id) nil then))
+
+(defun agmon--events (run-id after then &optional else)
+  "Async GET a page of RUN-ID's events after seq AFTER; call THEN with the batch.
+The batch is an alist with `events' (a list) and `next_after' (the
+cursor to poll with next).  ELSE handles a request failure."
+  (agmon--request (format "/v1/runs/%s/events?after=%d&limit=500" run-id after)
+                  nil then else))
 
 ;;;; Pure render layer
 ;;
@@ -717,6 +751,9 @@ against a canned payload."
 ;; `J' shows the raw /summary JSON for the run at point.
 (keymap-set agmon-list-mode-map "J" #'agmon-show-json)
 
+;; `t' opens a live event tail for the run at point.
+(keymap-set agmon-list-mode-map "t" #'agmon-tail)
+
 (defun agmon--list-refresh ()
   "Re-fetch the run list into `tabulated-list-entries', synchronously.
 Installed on `tabulated-list-revert-hook', so `g' refreshes now (blocking
@@ -808,7 +845,8 @@ it without another round-trip.")
   "TAB" #'agmon-detail-toggle-issues
   "<tab>" #'agmon-detail-toggle-issues
   "J" #'agmon-show-json
-  "RET" #'agmon-detail-follow)
+  "RET" #'agmon-detail-follow
+  "t" #'agmon-tail)
 
 (define-derived-mode agmon-detail-mode special-mode "Agmon-Detail"
   "Major mode for a single run's detail view.
@@ -994,6 +1032,358 @@ substring id matching, this offers every run for interactive narrowing."
                       (completing-read "Run: " candidates nil t))))
     (unless choice (user-error "No runs to jump to"))
     (agmon--open-detail (cdr (assoc choice candidates)) side)))
+
+;;;; Event-tail rendering (pure)
+;;
+;; These port the CLI's editorial event line (agmon/render.py
+;; `summarize_event' and the agmon/derive.py helpers it leans on) to
+;; Elisp.  They are pure -- an event alist in, a (TEXT . FACE) cons or a
+;; string out -- so ert can diff them against canned events, and the
+;; tail buffer below just inserts what they return.
+
+(defun agmon--event-type (event)
+  "Return EVENT's type, falling back to its payload's type."
+  (or (alist-get 'type event)
+      (let ((p (alist-get 'payload event)))
+        (and (listp p) (alist-get 'type p)))))
+
+(defun agmon--event-blocks (event)
+  "Return EVENT's message content blocks (each an alist), or nil."
+  (let* ((p (alist-get 'payload event))
+         (msg (and (listp p) (alist-get 'message p)))
+         (content (and (listp msg) (alist-get 'content msg))))
+    (and (listp content) (seq-filter #'listp content))))
+
+(defun agmon--event-text-blocks (event)
+  "Return the text of every text block in EVENT, in order.
+A bare string content counts as one block."
+  (let* ((p (alist-get 'payload event))
+         (msg (and (listp p) (alist-get 'message p)))
+         (content (and (listp msg) (alist-get 'content msg))))
+    (cond
+     ((stringp content) (list content))
+     ((listp content)
+      (delq nil
+            (mapcar (lambda (b)
+                      (and (listp b)
+                           (equal (alist-get 'type b) "text")
+                           (stringp (alist-get 'text b))
+                           (alist-get 'text b)))
+                    content)))
+     (t nil))))
+
+(defun agmon--content-to-text (content)
+  "Flatten a tool_result/result CONTENT into a plain string."
+  (cond
+   ((stringp content) content)
+   ((listp content)
+    (string-join
+     (delq nil
+           (mapcar (lambda (b)
+                     (cond
+                      ((and (listp b) (stringp (alist-get 'text b)))
+                       (alist-get 'text b))
+                      ((and (listp b) (stringp (alist-get 'content b)))
+                       (alist-get 'content b))
+                      ((stringp b) b)))
+                   content))
+     "\n"))
+   (t "")))
+
+(defun agmon--tool-target (input)
+  "Return a display target string from a tool_use INPUT alist, capped at 120."
+  (when (listp input)
+    (let ((target (cond
+                   ((stringp (alist-get 'file_path input)) (alist-get 'file_path input))
+                   ((stringp (alist-get 'command input)) (alist-get 'command input))
+                   (t (seq-find #'stringp (mapcar #'cdr input))))))
+      (when (stringp target)
+        (substring target 0 (min 120 (length target)))))))
+
+(defun agmon--event-progress (event)
+  "Return the last PROGRESS line in EVENT's first text block with one, or nil."
+  (catch 'found
+    (dolist (text (agmon--event-text-blocks event) nil)
+      (let ((start 0) (last nil))
+        (while (string-match "^PROGRESS: \\(.+\\)$" text start)
+          (setq last (match-string 1 text)
+                start (match-end 0)))
+        (when last (throw 'found last))))))
+
+(defun agmon--summarize-event (event)
+  "Return (TEXT . FACE) summarizing EVENT -- the ported CLI editorial line."
+  (let ((etype (agmon--event-type event))
+        (payload (let ((p (alist-get 'payload event))) (and (listp p) p))))
+    (pcase etype
+      ("_unparseable" (cons "<unparseable line>" 'error))
+      ("system"
+       (cons (format "system: %s"
+                     (or (alist-get 'subtype event)
+                         (alist-get 'subtype payload)
+                         "system"))
+             'shadow))
+      ("result"
+       (let* ((sub (or (alist-get 'subtype payload) (alist-get 'subtype event) "?"))
+              (ok (and (equal sub "success")
+                       (not (eq (alist-get 'is_error payload) t))))
+              (cost (alist-get 'total_cost_usd payload))
+              (turns (alist-get 'num_turns payload))
+              (bits (list (format "result: %s" sub))))
+         (when (numberp cost)
+           (setq bits (append bits (list (agmon--format-cost cost)))))
+         (when turns
+           (setq bits (append bits (list (format "%s turns" turns)))))
+         (cons (string-join bits " · ") (if ok 'success 'error))))
+      ("assistant"
+       (let ((progress (agmon--event-progress event)))
+         (if progress
+             (cons (format "PROGRESS: %s" progress) 'agmon-tail-progress)
+           (let ((tools (seq-filter (lambda (b) (equal (alist-get 'type b) "tool_use"))
+                                    (agmon--event-blocks event))))
+             (if tools
+                 (let* ((b0 (car tools))
+                        (name (or (alist-get 'name b0) "tool"))
+                        (target (or (agmon--tool-target (alist-get 'input b0)) ""))
+                        (extra (if (> (length tools) 1)
+                                   (format " (+%d more)" (1- (length tools))) "")))
+                   (cons (concat (agmon--oneline (format "→ %s %s" name target)) extra)
+                         'shadow))
+               (let ((texts (agmon--event-text-blocks event)))
+                 (cons (or (and texts (agmon--nonempty
+                                       (agmon--oneline (car (last texts)))))
+                           "assistant")
+                       'shadow)))))))
+      ("user"
+       (let* ((results (seq-filter (lambda (b) (equal (alist-get 'type b) "tool_result"))
+                                   (agmon--event-blocks event)))
+              (errored (seq-filter (lambda (b) (eq (alist-get 'is_error b) t)) results)))
+         (cond
+          (errored
+           (let ((snip (agmon--oneline
+                        (agmon--content-to-text (alist-get 'content (car errored))))))
+             (cons (if (agmon--nonempty snip) (format "error: %s" snip) "error") 'error)))
+          (results
+           (let ((snip (agmon--oneline
+                        (agmon--content-to-text (alist-get 'content (car results))))))
+             (cons (if (agmon--nonempty snip) (format "tool_result: %s" snip) "tool_result")
+                   'shadow)))
+          (t (let ((texts (agmon--event-text-blocks event)))
+               (cons (or (and texts (agmon--nonempty
+                                     (agmon--oneline (car (last texts)))))
+                         "user")
+                     'shadow))))))
+      (_ (cons (format "%s" (or etype (alist-get 'type event) "?")) 'shadow)))))
+
+(defun agmon--tail-event-line (event show-all)
+  "Render EVENT as a propertized tail line, or nil when filtered out.
+Events whose type is in `agmon-tail-hidden-types' are dropped unless
+SHOW-ALL.  The line is truncated to `agmon-tail-line-width'."
+  (unless (and (not show-all)
+               (member (agmon--event-type event) agmon-tail-hidden-types))
+    (let* ((s (agmon--summarize-event event))
+           (width (and (> agmon-tail-line-width 0) agmon-tail-line-width)))
+      (propertize (agmon--truncate (car s) width) 'face (cdr s)))))
+
+(defun agmon--tail-summary-line (status metrics)
+  "Render the tail's terminal verdict line from STATUS and METRICS."
+  (let* ((eff (or (alist-get 'effective_status status) "?"))
+         (cost (alist-get 'total_cost_usd metrics))
+         (dur (alist-get 'duration_seconds metrics))
+         (bits (list eff)))
+    (when (numberp cost)
+      (setq bits (append bits (list (agmon--format-cost cost)))))
+    (when (numberp dur)
+      (setq bits (append bits (list (agmon--format-age (floor dur))))))
+    (propertize (concat "── " (string-join bits " · "))
+                'face (agmon--status-face eff))))
+
+(defun agmon--tail-heartbeat (stalled-seconds)
+  "Render a stall heartbeat line for STALLED-SECONDS."
+  (propertize (format "⏳ stalled for %ss" (or stalled-seconds "?")) 'face 'warning))
+
+;;;; Event-tail buffer
+;;
+;; `t' on a run opens *agmon-tail:<id>*, which cursor-polls
+;; /events?after=<seq> using the returned next_after, appends the newly
+;; rendered lines, and repeats on a short timer -- under the same
+;; visibility discipline as the list.  The poll self-schedules (one-shot
+;; timer per round) so rounds never overlap; it stops for good at a
+;; terminal status.
+
+(defconst agmon--tail-terminal-statuses '("finished" "error" "interrupted" "died")
+  "Effective statuses at which the tail stops polling.")
+
+(defvar-local agmon--tail-run-id nil "Run id this tail follows.")
+(defvar-local agmon--tail-cursor 0 "Last event seq consumed (the poll cursor).")
+(defvar-local agmon--tail-timer nil "This tail's pending one-shot poll timer.")
+(defvar-local agmon--tail-terminal nil "Non-nil once the run reached a terminal status.")
+(defvar-local agmon--tail-show-all nil "Non-nil to show `agmon-tail-hidden-types' too.")
+(defvar-local agmon--tail-stalled-shown nil "Non-nil once a stall heartbeat was printed.")
+
+(defvar-keymap agmon-tail-mode-map
+  :doc "Keymap for `agmon-tail-mode'."
+  "a" #'agmon-tail-toggle-all)
+
+(define-derived-mode agmon-tail-mode special-mode "Agmon-Tail"
+  "Major mode for a live event tail of one run.
+
+\\{agmon-tail-mode-map}"
+  (setq-local revert-buffer-function #'agmon--tail-revert)
+  (visual-line-mode 1)
+  (add-hook 'kill-buffer-hook #'agmon--tail-cancel-timer nil t))
+
+(defun agmon--tail-cancel-timer ()
+  "Cancel this tail's pending poll timer.
+On `kill-buffer-hook', so killing the buffer provably stops polling."
+  (when agmon--tail-timer
+    (cancel-timer agmon--tail-timer)
+    (setq agmon--timers (delq agmon--tail-timer agmon--timers))
+    (setq agmon--tail-timer nil)))
+
+(defun agmon--tail-schedule (buffer)
+  "Schedule BUFFER's next poll one `agmon-tail-poll-seconds' from now."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (agmon--tail-cancel-timer)
+      (when (> agmon-tail-poll-seconds 0)
+        (setq agmon--tail-timer
+              (run-with-timer agmon-tail-poll-seconds nil
+                              #'agmon--tail-poll buffer))
+        (push agmon--tail-timer agmon--timers)))))
+
+(defun agmon--tail-insert (strings)
+  "Append STRINGS (rendered lines) at end of buffer, following at the bottom.
+A window parked at the end (and point, if it was at the end) stays
+pinned to the new bottom; a window scrolled up is left where it is."
+  (when strings
+    (let ((inhibit-read-only t)
+          (windows (get-buffer-window-list (current-buffer) nil t))
+          (at-point-end (>= (point) (point-max)))
+          (follow nil))
+      (dolist (w windows)
+        (when (>= (window-point w) (point-max)) (push w follow)))
+      (save-excursion
+        (goto-char (point-max))
+        (insert (mapconcat #'identity strings "\n") "\n"))
+      (dolist (w follow) (set-window-point w (point-max)))
+      (when at-point-end (goto-char (point-max))))))
+
+(defun agmon--tail-poll (buffer)
+  "One poll round for BUFFER: fetch events after the cursor and consume them.
+Fetches only while a window shows BUFFER (a buried tail makes no
+requests); reschedules itself unless the run is terminal."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (cond
+       (agmon--tail-terminal nil)
+       ((not (get-buffer-window buffer 'visible))
+        (agmon--tail-schedule buffer))   ; keep the schedule alive, skip the fetch
+       (t
+        (agmon--events
+         agmon--tail-run-id agmon--tail-cursor
+         (lambda (batch)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (agmon--tail-consume batch)
+               (unless agmon--tail-terminal (agmon--tail-schedule buffer)))))
+         (lambda (err)
+           (agmon--report-request-failure "tail" err)
+           (unless (and (buffer-live-p buffer)
+                        (with-current-buffer buffer agmon--tail-terminal))
+             (agmon--tail-schedule buffer)))))))))
+
+(defun agmon--tail-consume (batch)
+  "Render BATCH's events into the buffer and act on terminal signals."
+  (let ((events (alist-get 'events batch))
+        (next (alist-get 'next_after batch)))
+    (agmon--tail-insert
+     (delq nil (mapcar (lambda (e) (agmon--tail-event-line e agmon--tail-show-all))
+                       events)))
+    (when next (setq agmon--tail-cursor next))
+    (cond
+     ;; A result event means the run finished/errored: stop now, verdict async.
+     ((seq-find (lambda (e) (equal (agmon--event-type e) "result")) events)
+      (setq agmon--tail-terminal t)
+      (agmon--tail-cancel-timer)
+      (agmon--tail-conclude))
+     ;; An empty poll: the non-result terminal states (interrupted/died) and
+     ;; the stall heartbeat can only be told apart via /summary.
+     ((null events)
+      (agmon--tail-check-status)))))
+
+(defun agmon--tail-conclude ()
+  "Fetch the summary and print the terminal verdict line for this tail."
+  (let ((buffer (current-buffer)))
+    (agmon--summary
+     agmon--tail-run-id
+     (lambda (summary)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer (agmon--tail-finish summary)))))))
+
+(defun agmon--tail-check-status ()
+  "On an empty poll, fetch the summary and conclude if terminal, else heartbeat."
+  (let ((buffer (current-buffer)))
+    (agmon--summary
+     agmon--tail-run-id
+     (lambda (summary)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (let* ((status (alist-get 'status summary))
+                  (eff (alist-get 'effective_status status)))
+             (cond
+              ((member eff agmon--tail-terminal-statuses)
+               (agmon--tail-finish summary))
+              ((and (equal eff "stalled") (not agmon--tail-stalled-shown))
+               (setq agmon--tail-stalled-shown t)
+               (agmon--tail-insert
+                (list (agmon--tail-heartbeat
+                       (alist-get 'stalled_seconds status)))))))))))))
+
+(defun agmon--tail-finish (summary)
+  "Print the verdict from SUMMARY, stop polling, and message the outcome."
+  (setq agmon--tail-terminal t)
+  (agmon--tail-cancel-timer)
+  (let* ((status (alist-get 'status summary))
+         (metrics (alist-get 'metrics summary))
+         (eff (or (alist-get 'effective_status status) "?")))
+    (agmon--tail-insert (list (agmon--tail-summary-line status metrics)))
+    (message "agmon: tail %s %s" (agmon--short-id agmon--tail-run-id) eff)))
+
+(defun agmon--tail-revert (&rest _)
+  "Restart this tail from the first event, re-rendering with the current filter.
+Installed as `revert-buffer-function', so `g' (or `gr' under evil) restarts."
+  (setq agmon--tail-cursor 0
+        agmon--tail-terminal nil
+        agmon--tail-stalled-shown nil)
+  (let ((inhibit-read-only t)) (erase-buffer))
+  (agmon--tail-poll (current-buffer)))
+
+(defun agmon-tail-toggle-all ()
+  "Toggle showing every event type, including the low-value ones, then restart."
+  (interactive)
+  (setq agmon--tail-show-all (not agmon--tail-show-all))
+  (message "agmon: tail showing %s events"
+           (if agmon--tail-show-all "all" "curated"))
+  (agmon--tail-revert))
+
+(defun agmon-tail (&optional run-id)
+  "Open a live event tail for RUN-ID, defaulting to the run at point.
+Works from the run list and a detail buffer.  The buffer polls while
+visible and stops at a terminal status; `a' toggles the low-value
+filter, `q' buries, `g' restarts."
+  (interactive)
+  (let ((id (or run-id (agmon--run-id-at-point))))
+    (unless id (user-error "No run at point"))
+    (let ((buf (get-buffer-create (format "*agmon-tail: %s*" (agmon--short-id id)))))
+      (with-current-buffer buf
+        (agmon-tail-mode)
+        (setq agmon--tail-run-id id
+              agmon--tail-cursor 0
+              agmon--tail-terminal nil
+              agmon--tail-stalled-shown nil)
+        (let ((inhibit-read-only t)) (erase-buffer)))
+      (pop-to-buffer buf)
+      (agmon--tail-poll buf))))
 
 ;;;###autoload
 (defun agmon ()
