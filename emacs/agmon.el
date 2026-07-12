@@ -782,6 +782,45 @@ Works from the run list (the row at point) and from a detail buffer
         (agmon--json-render))
       (pop-to-buffer buf))))
 
+;;;; Jump to a run
+;;
+;; `agmon-jump' is a completing-read over every run, openable from any
+;; buffer.  It supersedes the CLI's substring id resolver: rather than
+;; typing a fragment and hoping it is unambiguous, you narrow the live
+;; candidate list with your completion UI (Vertico, etc.) and pick.
+
+(defun agmon--jump-candidate (run)
+  "Format RUN as an `agmon-jump' completion candidate.
+Shows the short id, the status (in its status face), the abbreviated
+cwd, and a truncated task preview -- the preview is what tells two
+same-repo runs apart, so the candidate list scans like a compact run
+list."
+  (let-alist run
+    (let ((status (or .effective_status "")))
+      (format "%-8s  %s  %-20s  %s"
+              (agmon--short-id .run_id)
+              (propertize (format "%-11s" status)
+                          'face (agmon--status-face status))
+              (agmon--truncate (agmon--abbrev-path (or .cwd "")) 20)
+              (agmon--truncate (agmon--oneline (or .prompt_preview "")) 60)))))
+
+;;;###autoload
+(defun agmon-jump (&optional side)
+  "Pick a run by completion and open its detail buffer, from anywhere.
+Candidates show each run's id, status, and cwd.  With a prefix argument
+\(SIDE non-nil) open the detail in a side window.  Unlike the CLI's
+substring id matching, this offers every run for interactive narrowing."
+  (interactive "P")
+  (let* ((runs (agmon--runs))
+         (candidates (mapcar (lambda (run)
+                               (cons (agmon--jump-candidate run)
+                                     (alist-get 'run_id run)))
+                             runs))
+         (choice (and candidates
+                      (completing-read "Run: " candidates nil t))))
+    (unless choice (user-error "No runs to jump to"))
+    (agmon--open-detail (cdr (assoc choice candidates)) side)))
+
 ;;;###autoload
 (defun agmon ()
   "Open the *agmon* buffer listing every run in the fleet."
