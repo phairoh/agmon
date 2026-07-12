@@ -54,7 +54,8 @@ class StubClient:
         self._runs = runs
         self._summary = summary
 
-    def list_runs(self, *, status=None, limit=50, session=None):
+    def list_runs(self, *, status=None, limit=50, session=None, labels=None):
+        self.last_labels = labels
         runs = self._runs
         if session is not None:
             runs = [r for r in runs if r.get("session_id") == session]
