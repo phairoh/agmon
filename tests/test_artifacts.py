@@ -61,6 +61,51 @@ def _bash(command, _id="b"):
     }
 
 
+def _tool_error(seq, tool_use_id, text="permission denied"):
+    """A user event carrying an errored tool_result (real spool shape: a
+    ``user`` message whose content is a ``tool_result`` block with
+    ``is_error: True`` referencing an earlier tool_use id)."""
+    return {
+        "seq": seq,
+        "type": "user",
+        "subtype": None,
+        "payload": {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "is_error": True,
+                        "content": text,
+                    }
+                ],
+            },
+        },
+    }
+
+
+# -- F1: rejected (errored) file ops must not be surfaced --------------------
+
+
+@pytest.mark.xfail(strict=True, reason="F1")
+def test_rejected_write_not_surfaced_as_content():
+    # A permission-denied / rejected Write never touched disk — the run's
+    # tool_result flags is_error True (observed in ~/agent-runs, e.g.
+    # 20260708T220925-daadb1 writing /tmp/check_json.py). Its content must not
+    # be surfaced as the file's reconstructed content.
+    events = [
+        _assistant(1, _write("/tmp/check.py", "PHANTOM CONTENT\n", _id="w1")),
+        _tool_error(2, "w1"),
+    ]
+    try:
+        content = artifacts.reconstruct_file(events, "/tmp/check.py")
+    except (artifacts.ArtifactUnknown, artifacts.ArtifactUnavailable):
+        return  # correct: the write was rejected, nothing to reconstruct
+    assert "PHANTOM" not in content
+
+
 # -- section parser ----------------------------------------------------------
 
 
