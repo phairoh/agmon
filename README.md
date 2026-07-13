@@ -120,6 +120,8 @@ agmon ls                        # fleet glance, newest first (-n N, --all)
 agmon ls --status running       # filter by raw status (also --session <sid>)
 agmon ls --pipeline nightly     # label filter (also --phase Y, --label k=v ×N)
 agmon show a3f9                 # one run, digested (--full-prompt, --raw)
+agmon artifacts a3f9            # list a run's named artifacts (name/kind/available/size)
+agmon artifacts --get REVIEW.md         # fetch one artifact's content raw to stdout
 agmon tail                      # live-follow the latest run (--last N)
 agmon events a3f9 --errors-only     # forensics table (--type, --after, -n)
 agmon costs --days 7            # cost/turn rollup (--since/--until)
@@ -134,7 +136,9 @@ it, so the table swaps in a `phase` column; otherwise a compact `labels` cell
 appears only for the runs that carry labels. `agmon show` prints a **Pipeline**
 section (id, phase, parent/children, a sibling table) whenever a run has
 pipeline lineage — kept visually separate from the resume-chain lines so the two
-relations don't read as one. `agmon run` accepts `--label KEY=VALUE`
+relations don't read as one. When the result carries a `DECISIONS` section
+`agmon show` renders it as its own **Decisions** block, just before the full
+result. `agmon run` accepts `--label KEY=VALUE`
 (repeatable) plus the `--pipeline`/`--phase`/`--parent` sugar (see the spool
 contract above for constraints).
 
@@ -158,6 +162,51 @@ uv tool install agmon           # or: pipx install agmon
 export AGMON_URL=http://server-box:8400
 agmon ls
 ```
+
+## Artifacts
+
+A run produces durable things git forgets — a review file that consolidation
+deletes, a DECISIONS block that lives only in the final message, the composed
+prompt with its appended sections. The spool holds all of them, so every run
+exposes a queryable **artifact catalog**: named things you list and fetch by
+name, without knowing where any of them physically lived.
+
+Two families. **Dispatch/section** artifacts come from the run record itself and
+always list (available or not — the catalog shows what *could* exist):
+
+| name                | source                             | available when            |
+|---------------------|------------------------------------|---------------------------|
+| `prompt`            | the stored composed prompt         | always                    |
+| `prompt.focus`      | `FOCUS` section of the prompt      | marker present            |
+| `prompt.overrides`  | `OVERRIDES` section of the prompt  | marker present            |
+| `result`            | the run's result text              | run produced a result     |
+| `result.decisions`  | `DECISIONS` section of the result  | marker present            |
+
+**File** artifacts are files the run wrote, reconstructed from its `Write`/`Edit`
+tool events and named by their path. `REVIEW.md` is the motivating case:
+recoverable from the spool forever, even after the run itself deleted it.
+
+```sh
+agmon artifacts a3f9                    # the catalog: name, kind, available, size
+agmon artifacts a3f9 --get REVIEW.md    # raw content to stdout (pipe to a file or diff)
+agmon artifacts --get prompt.overrides  # a dispatch section, same interface
+```
+
+**Section-marker convention** (how foreign runs participate). A section marker
+is the bare ALL-CAPS word (`DECISIONS`, `FOCUS`, `OVERRIDES`) on its own line —
+optionally prefixed with markdown heading syntax (`#`–`###`) and optionally
+suffixed with `:`, anchored at line start, so the word mid-prose never triggers.
+A section runs from its **last** marker occurrence to the next marker line (any
+bare ALL-CAPS heading) or end of text, the heading line excluded. Emit a
+`## DECISIONS` heading in your final message and it becomes `result.decisions`.
+
+**Reconstruction limitations.** A file is *reconstructable* only when its op
+sequence starts from a `Write` (known-full content); an edit-only file is listed
+but honestly marked unavailable — the spool knows the patches, not the base.
+Reconstruction returns the last written content and makes **no claim about
+current disk state**: if the run later deleted or a later run changed the file,
+that is not reflected. Binary content, cross-run file state, and "file at time
+T" time-travel are out of scope.
 
 ## Emacs
 
@@ -242,6 +291,13 @@ Full run row including `prompt`, the `labels` object, and the parsed `meta_json`
 (everything from the spool `.meta.json`, including fields not columnized), plus
 the same computed fields. 404 with `{"error": "..."}` for an unknown id.
 
+`model` is **observed**, not requested: it is harvested at ingest time from the
+run's init system event (the resolved model that actually served, e.g.
+`claude-opus-4-8[1m]`), and stays **null** for a run killed before init — "never
+observed", not "unknown". The `--model` *argument* (dispatch intent, rarely
+passed) is recorded separately in meta as `model_requested`, retrievable through
+the `meta_json` passthrough; it is never used as a fallback for `model`.
+
 ```sh
 curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
 ```
@@ -249,14 +305,16 @@ curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
 ### `GET /v1/runs/{run_id}/summary`
 
 The full picture for one run: `{run, status, activity, issues, metrics,
-result_text, lineage}`. `status` is the derived status block above; `activity`
-is `{last_tool, last_text, progress}`; `issues` is the most recent 50
+result_text, decisions, lineage}`. `status` is the derived status block above;
+`activity` is `{last_tool, last_text, progress}`; `issues` is the most recent 50
 error-flagged tool_results and non-success results (`{seq, category, tool,
 snippet}`, where `category` is `permission` / `tool_error` / `run_error`);
 `metrics` is `{num_events, tool_counts, duration_seconds, num_turns,
 total_cost_usd, usage}`; `result_text` is the full `result` string from the
-run's result event (null if absent). `run.labels` carries the run's labels.
-All events for the run are loaded per request (no caching).
+run's result event (null if absent); `decisions` is the `DECISIONS` section
+parsed from that result (null if absent — see [Artifacts](#artifacts)).
+`run.labels` carries the run's labels. All events for the run are loaded per
+request (no caching).
 
 `lineage` is the pipeline-lineage block derived from the reserved labels, or
 `null` when the run carries none of them:
@@ -277,6 +335,29 @@ validated. This is **distinct** from the resume-chain lineage (shared
 
 ```sh
 curl -s localhost:8400/v1/runs/20260708T174951-67a5e8/summary
+```
+
+### `GET /v1/runs/{run_id}/artifacts`
+
+The run's artifact catalog (see [Artifacts](#artifacts)): `{"artifacts": [...]}`,
+both families in one list. Each item carries `name`, `kind` (`dispatch` /
+`section` / `file`), `available` (bool), `bytes` when available, and a `reason`
+when not (an absent section marker, or a non-reconstructable file). File items
+additionally carry `path`, `ops`, `first_op` (`write`/`edit`), `last_seq`, and
+`reconstructable`. Dispatch/section artifacts always list — absence is visible,
+not silent. 404 for an unknown run id.
+
+### `GET /v1/runs/{run_id}/artifacts/content?name=<name>`
+
+One artifact's content as `text/plain; charset=utf-8`. Name resolution, in
+order: exact dispatch/section name; exact file path; unique file **basename or
+substring** (so `name=REVIEW.md` fetches the review without its worktree path).
+`404` for an unknown name, `409` with a JSON `reason` for a listed-but-
+unavailable artifact, `400` with `candidates` for an ambiguous fragment.
+
+```sh
+curl -s "localhost:8400/v1/runs/20260708T174951-67a5e8/artifacts"
+curl -s "localhost:8400/v1/runs/20260708T174951-67a5e8/artifacts/content?name=REVIEW.md"
 ```
 
 ### `GET /v1/runs/{run_id}/events?after=<seq>&limit=<n>&errors_only=<bool>`
