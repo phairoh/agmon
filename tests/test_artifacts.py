@@ -11,7 +11,15 @@ other integration suites.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
 from agmon import artifacts
+from agmon.api import create_app
+from agmon.config import Config
 
 
 def _write(seq, file_path, content, tool_use_id="t"):
@@ -378,3 +386,177 @@ def test_resolve_ambiguous_basename_beats_substring_tier():
     ]
     content = artifacts.resolve_artifact_content(run, events, "REVIEW.md")
     assert content == "short"
+
+
+# ============================================================================
+# 3. API — /v1/runs/{id}/artifacts, /artifacts/content, summary.decisions
+# ============================================================================
+
+
+@pytest.fixture()
+def env(tmp_path: Path):
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    config = Config(
+        runs_dir=runs_dir, db_path=tmp_path / "agmon.db",
+        host="127.0.0.1", port=8400, stall_seconds=300,
+    )
+    app = create_app(config)
+    client = TestClient(app)
+    ingester = app.state.ingester
+    try:
+        yield runs_dir, client, ingester
+    finally:
+        ingester.conn.close()
+
+
+def write_meta(runs_dir: Path, run_id: str, **fields) -> None:
+    meta = {"run_id": run_id, "git": {"branch": "main", "commit": "abc123"}}
+    meta.update(fields)
+    (runs_dir / f"{run_id}.meta.json").write_text(json.dumps(meta))
+
+
+def jsonl_lines(*events) -> str:
+    return "".join(json.dumps(e) + "\n" for e in events)
+
+
+def _write_event(seq, file_path, content):
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": f"t{seq}", "name": "Write",
+                 "input": {"file_path": file_path, "content": content}},
+            ],
+        },
+    }
+
+
+def _full_run(runs_dir: Path, ingester, run_id: str) -> None:
+    write_meta(
+        runs_dir, run_id, status="finished", prompt=FULL_PROMPT,
+        started_at="2026-07-09T00:00:00+00:00",
+    )
+    (runs_dir / f"{run_id}.jsonl").write_text(
+        jsonl_lines(
+            {"type": "system", "subtype": "init"},
+            _write_event(1, "/worktree/REVIEW.md", "# Review\n\nlooks good\n"),
+            {"type": "result", "subtype": "success", "result": FULL_RESULT},
+        )
+    )
+    ingester.scan()
+
+
+def test_api_artifacts_catalog(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-aaaaaa"
+    _full_run(runs_dir, ingester, run_id)
+
+    resp = client.get(f"/v1/runs/{run_id}/artifacts")
+    assert resp.status_code == 200
+    by_name = {a["name"]: a for a in resp.json()["artifacts"]}
+    assert by_name["prompt"]["available"] is True
+    assert by_name["prompt.focus"]["available"] is True
+    assert by_name["result.decisions"]["available"] is True
+    assert by_name["/worktree/REVIEW.md"]["kind"] == "file"
+    assert by_name["/worktree/REVIEW.md"]["available"] is True
+
+
+def test_api_artifacts_unknown_run_404(env):
+    _, client, _ = env
+    assert client.get("/v1/runs/nope/artifacts").status_code == 404
+    assert client.get("/v1/runs/nope/artifacts/content?name=prompt").status_code == 404
+
+
+def test_api_artifact_content_dispatch(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-bbbbbb"
+    _full_run(runs_dir, ingester, run_id)
+
+    resp = client.get(f"/v1/runs/{run_id}/artifacts/content", params={"name": "prompt.focus"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.text == "focus on X"
+
+
+def test_api_artifact_content_file_by_basename(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-cccccc"
+    _full_run(runs_dir, ingester, run_id)
+
+    resp = client.get(f"/v1/runs/{run_id}/artifacts/content", params={"name": "REVIEW.md"})
+    assert resp.status_code == 200
+    assert resp.text == "# Review\n\nlooks good\n"
+
+
+def test_api_artifact_content_unknown_name_404(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-dddddd"
+    _full_run(runs_dir, ingester, run_id)
+
+    resp = client.get(f"/v1/runs/{run_id}/artifacts/content", params={"name": "nope.md"})
+    assert resp.status_code == 404
+    assert resp.json()["error"]
+
+
+def test_api_artifact_content_unavailable_409(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-eeeeee"
+    write_meta(runs_dir, run_id, status="finished", prompt="no sections here",
+               started_at="2026-07-09T00:00:00+00:00")
+    (runs_dir / f"{run_id}.jsonl").write_text(
+        jsonl_lines({"type": "system", "subtype": "init"})
+    )
+    ingester.scan()
+
+    resp = client.get(f"/v1/runs/{run_id}/artifacts/content", params={"name": "prompt.focus"})
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"]
+    assert body["reason"]
+
+
+def test_api_artifact_content_ambiguous_400(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-ffffff"
+    write_meta(runs_dir, run_id, status="finished", prompt=None,
+               started_at="2026-07-09T00:00:00+00:00")
+    (runs_dir / f"{run_id}.jsonl").write_text(
+        jsonl_lines(
+            {"type": "system", "subtype": "init"},
+            _write_event(1, "/a/REVIEW.md", "one"),
+            _write_event(2, "/b/REVIEW.md", "two"),
+        )
+    )
+    ingester.scan()
+
+    resp = client.get(f"/v1/runs/{run_id}/artifacts/content", params={"name": "REVIEW.md"})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]
+    assert set(body["candidates"]) == {"/a/REVIEW.md", "/b/REVIEW.md"}
+
+
+def test_summary_includes_decisions(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-999999"
+    _full_run(runs_dir, ingester, run_id)
+
+    resp = client.get(f"/v1/runs/{run_id}/summary")
+    assert resp.status_code == 200
+    assert resp.json()["decisions"] == "picked approach A"
+
+
+def test_summary_decisions_null_when_absent(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-888888"
+    write_meta(runs_dir, run_id, status="running", prompt="hi",
+               started_at="2026-07-09T00:00:00+00:00")
+    (runs_dir / f"{run_id}.jsonl").write_text(
+        jsonl_lines({"type": "system", "subtype": "init"})
+    )
+    ingester.scan()
+
+    resp = client.get(f"/v1/runs/{run_id}/summary")
+    assert resp.json()["decisions"] is None
