@@ -273,3 +273,8 @@ def test_section_null_text_returns_none():
 def test_section_empty_between_marker_and_next():
     text = "DECISIONS\nFOCUS\nbody\n"
     assert derive.derive_section(text, "DECISIONS") == ""
+
+
+def test_section_trailing_blank_line_before_next_marker_is_stripped():
+    text = "FOCUS\nfocus on X\n\nOVERRIDES\nignore Y\n"
+    assert derive.derive_section(text, "FOCUS") == "focus on X"

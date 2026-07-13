@@ -196,3 +196,185 @@ def test_reconstruct_unknown_path_raises():
 
     with pytest.raises(artifacts.ArtifactNotFound):
         artifacts.reconstruct_file([], "/nope.py")
+
+
+# ============================================================================
+# 2. Catalog + name resolution — build_catalog / resolve_artifact_content
+# ============================================================================
+
+
+def _result_event(seq, text):
+    return {
+        "seq": seq,
+        "type": "result",
+        "subtype": "success",
+        "payload": {"type": "result", "subtype": "success", "result": text},
+    }
+
+
+FULL_PROMPT = "do the thing\n\nFOCUS\nfocus on X\n\nOVERRIDES\nignore Y\n"
+FULL_RESULT = "the task is done\n\nDECISIONS\npicked approach A\n"
+
+
+def _full_run_events():
+    return [
+        _write(1, "/worktree/REVIEW.md", "# Review\n\nlooks good\n"),
+        _result_event(2, FULL_RESULT),
+    ]
+
+
+def test_catalog_full_run_lists_all_artifacts():
+    run = {"prompt": FULL_PROMPT}
+    events = _full_run_events()
+    catalog = artifacts.build_catalog(run, events)
+    by_name = {a["name"]: a for a in catalog}
+
+    assert set(by_name) == {
+        "prompt", "prompt.focus", "prompt.overrides",
+        "result", "result.decisions", "/worktree/REVIEW.md",
+    }
+    assert by_name["prompt"]["kind"] == "dispatch"
+    assert by_name["prompt"]["available"] is True
+    assert by_name["prompt.focus"]["kind"] == "section"
+    assert by_name["prompt.focus"]["available"] is True
+    assert by_name["prompt.overrides"]["available"] is True
+    assert by_name["result"]["available"] is True
+    assert by_name["result.decisions"]["available"] is True
+    review = by_name["/worktree/REVIEW.md"]
+    assert review["kind"] == "file"
+    assert review["available"] is True
+    assert review["reconstructable"] is True
+    assert review["bytes"] == len("# Review\n\nlooks good\n".encode("utf-8"))
+
+
+def test_catalog_bare_run_dispatch_only_unavailable_with_reasons():
+    run = {"prompt": None}
+    events = []
+    catalog = artifacts.build_catalog(run, events)
+    assert [a["name"] for a in catalog] == [
+        "prompt", "prompt.focus", "prompt.overrides", "result", "result.decisions",
+    ]
+    for item in catalog:
+        assert item["available"] is False
+        assert item["reason"]
+        assert "bytes" not in item
+
+
+def test_catalog_dispatch_order_stable():
+    run = {"prompt": FULL_PROMPT}
+    catalog = artifacts.build_catalog(run, _full_run_events())
+    dispatch_names = [a["name"] for a in catalog if a["kind"] in ("dispatch", "section")]
+    assert dispatch_names == [
+        "prompt", "prompt.focus", "prompt.overrides", "result", "result.decisions",
+    ]
+
+
+def test_catalog_marker_absent_is_unavailable_with_reason():
+    run = {"prompt": "no sections here\n"}
+    catalog = artifacts.build_catalog(run, [])
+    by_name = {a["name"]: a for a in catalog}
+    assert by_name["prompt.focus"]["available"] is False
+    assert "FOCUS" in by_name["prompt.focus"]["reason"]
+
+
+def test_catalog_edit_only_file_listed_unavailable():
+    run = {"prompt": None}
+    events = [_edit(1, "/repo/a.py", "x", "y")]
+    catalog = artifacts.build_catalog(run, events)
+    by_name = {a["name"]: a for a in catalog}
+    file_item = by_name["/repo/a.py"]
+    assert file_item["kind"] == "file"
+    assert file_item["available"] is False
+    assert file_item["reason"]
+    assert "bytes" not in file_item
+
+
+# -- resolve_artifact_content -------------------------------------------------
+
+
+def test_resolve_dispatch_exact_name():
+    run = {"prompt": FULL_PROMPT}
+    events = _full_run_events()
+    assert artifacts.resolve_artifact_content(run, events, "prompt") == FULL_PROMPT
+    assert artifacts.resolve_artifact_content(run, events, "prompt.focus") == "focus on X"
+    assert artifacts.resolve_artifact_content(run, events, "result.decisions") == "picked approach A"
+
+
+def test_resolve_exact_file_path():
+    run = {"prompt": None}
+    events = _full_run_events()
+    content = artifacts.resolve_artifact_content(run, events, "/worktree/REVIEW.md")
+    assert content == "# Review\n\nlooks good\n"
+
+
+def test_resolve_unique_basename():
+    run = {"prompt": None}
+    events = _full_run_events()
+    content = artifacts.resolve_artifact_content(run, events, "REVIEW.md")
+    assert content == "# Review\n\nlooks good\n"
+
+
+def test_resolve_unique_substring():
+    run = {"prompt": None}
+    events = _full_run_events()
+    content = artifacts.resolve_artifact_content(run, events, "EVIEW")
+    assert content == "# Review\n\nlooks good\n"
+
+
+def test_resolve_ambiguous_fragment_lists_candidates():
+    run = {"prompt": None}
+    events = [
+        _write(1, "/a/REVIEW.md", "one"),
+        _write(2, "/b/REVIEW.md", "two"),
+    ]
+    import pytest
+
+    with pytest.raises(artifacts.AmbiguousArtifactName) as exc:
+        artifacts.resolve_artifact_content(run, events, "REVIEW.md")
+    assert set(exc.value.candidates) == {"/a/REVIEW.md", "/b/REVIEW.md"}
+
+
+def test_resolve_unknown_name_raises_not_found():
+    run = {"prompt": None}
+    import pytest
+
+    with pytest.raises(artifacts.ArtifactNotFound):
+        artifacts.resolve_artifact_content(run, [], "nope.md")
+
+
+def test_resolve_unavailable_section_raises_with_reason():
+    run = {"prompt": "no sections\n"}
+    import pytest
+
+    with pytest.raises(artifacts.ArtifactUnavailable) as exc:
+        artifacts.resolve_artifact_content(run, [], "prompt.focus")
+    assert exc.value.reason
+
+
+def test_resolve_unavailable_result_when_absent():
+    run = {"prompt": None}
+    import pytest
+
+    with pytest.raises(artifacts.ArtifactUnavailable):
+        artifacts.resolve_artifact_content(run, [], "result")
+
+
+def test_resolve_non_reconstructable_file_raises_unavailable():
+    run = {"prompt": None}
+    events = [_edit(1, "/repo/a.py", "x", "y")]
+    import pytest
+
+    with pytest.raises(artifacts.ArtifactUnavailable):
+        artifacts.resolve_artifact_content(run, events, "/repo/a.py")
+
+
+def test_resolve_ambiguous_basename_beats_substring_tier():
+    # An exact-basename match should resolve even though a longer path also
+    # contains the fragment as a substring — the basename tier wins outright.
+    run = {"prompt": None}
+    events = [
+        _write(1, "/a/REVIEW.md", "short"),
+        _write(2, "/b/OLD_REVIEW.md", "long"),
+    ]
+    content = artifacts.resolve_artifact_content(run, events, "REVIEW.md")
+    assert content == "short"

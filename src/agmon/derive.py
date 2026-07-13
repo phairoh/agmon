@@ -265,10 +265,7 @@ def derive_section(text: str | None, marker: str) -> str | None:
         start += 1
     next_marker = _ANY_MARKER_LINE_RE.search(text, start)
     end = next_marker.start() if next_marker else len(text)
-    section = text[start:end]
-    if section.endswith("\n"):
-        section = section[:-1]
-    return section
+    return text[start:end].rstrip("\n")
 
 
 # -- result text -------------------------------------------------------------

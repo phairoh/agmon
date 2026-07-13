@@ -125,3 +125,119 @@ def reconstruct_file(events: list[dict], path: str) -> str:
     if ops[0]["op"] != "write":
         raise NotReconstructableError(path)
     return _apply_ops(ops)
+
+
+# -- dispatch/section artifacts -------------------------------------------------
+
+# The five fixed dispatch/section artifacts, in catalog order.
+_DISPATCH_SPECS = (
+    ("prompt", "dispatch", "prompt", None),
+    ("prompt.focus", "section", "prompt", "FOCUS"),
+    ("prompt.overrides", "section", "prompt", "OVERRIDES"),
+    ("result", "dispatch", "result", None),
+    ("result.decisions", "section", "result", "DECISIONS"),
+)
+
+_BASE_MISSING_REASON = {
+    "prompt": "no prompt recorded",
+    "result": "run produced no result",
+}
+
+
+def _dispatch_items(prompt: str | None, result_text: str | None) -> list[dict]:
+    """The five dispatch/section artifacts with resolved content (``None``
+    when unavailable) and, when so, a reason."""
+    bases = {"prompt": prompt or None, "result": result_text or None}
+    items = []
+    for name, kind, base_key, marker in _DISPATCH_SPECS:
+        base = bases[base_key]
+        if marker is None:
+            content = base
+            reason = None if content is not None else _BASE_MISSING_REASON[base_key]
+        elif base is None:
+            content = None
+            reason = _BASE_MISSING_REASON[base_key]
+        else:
+            content = derive_section(base, marker)
+            reason = None if content is not None else f"{marker} marker not present"
+        items.append({"name": name, "kind": kind, "content": content, "reason": reason})
+    return items
+
+
+# -- catalog ---------------------------------------------------------------
+
+
+def build_catalog(run: dict, events: list[dict]) -> list[dict]:
+    """Both artifact families for one run, in catalog order: the five
+    dispatch/section artifacts (always listed, available or not) followed by
+    file artifacts sorted by path."""
+    result_text = derive_result_text(events)
+    catalog = []
+    for it in _dispatch_items(run.get("prompt"), result_text):
+        entry = {"name": it["name"], "kind": it["kind"], "available": it["content"] is not None}
+        if entry["available"]:
+            entry["bytes"] = len(it["content"].encode("utf-8"))
+        else:
+            entry["reason"] = it["reason"]
+        catalog.append(entry)
+    for fa in derive_file_artifacts(events):
+        entry = {
+            "name": fa["path"],
+            "kind": "file",
+            "path": fa["path"],
+            "ops": fa["ops"],
+            "first_op": fa["first_op"],
+            "last_seq": fa["last_seq"],
+            "reconstructable": fa["reconstructable"],
+            "available": fa["reconstructable"],
+        }
+        if fa["reconstructable"]:
+            entry["bytes"] = fa["bytes"]
+        else:
+            entry["reason"] = "edit-only: no Write establishes a base to reconstruct from"
+        catalog.append(entry)
+    return catalog
+
+
+# -- name resolution ---------------------------------------------------------
+
+
+def _basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1]
+
+
+def _resolve_file(files: list[dict], name: str) -> dict:
+    """§4 resolution order for file artifacts: exact path; unique basename;
+    unique substring; else ambiguous/not-found."""
+    for fa in files:
+        if fa["path"] == name:
+            return fa
+    basename_matches = [fa for fa in files if _basename(fa["path"]) == name]
+    if len(basename_matches) == 1:
+        return basename_matches[0]
+    if len(basename_matches) > 1:
+        raise AmbiguousArtifactName(name, sorted(fa["path"] for fa in basename_matches))
+    substring_matches = [fa for fa in files if name in fa["path"]]
+    if len(substring_matches) == 1:
+        return substring_matches[0]
+    if len(substring_matches) > 1:
+        raise AmbiguousArtifactName(name, sorted(fa["path"] for fa in substring_matches))
+    raise ArtifactNotFound(name)
+
+
+def resolve_artifact_content(run: dict, events: list[dict], name: str) -> str:
+    """Resolve ``name`` to content per the §4 order: exact dispatch-artifact
+    name, exact file path, unique file basename or substring. Raises
+    ``ArtifactNotFound``, ``ArtifactUnavailable``, or ``AmbiguousArtifactName``."""
+    result_text = derive_result_text(events)
+    for it in _dispatch_items(run.get("prompt"), result_text):
+        if it["name"] == name:
+            if it["content"] is None:
+                raise ArtifactUnavailable(it["reason"])
+            return it["content"]
+
+    files = derive_file_artifacts(events)
+    match = _resolve_file(files, name)
+    if not match["reconstructable"]:
+        raise ArtifactUnavailable("edit-only: no Write establishes a base to reconstruct from")
+    return reconstruct_file(events, match["path"])
