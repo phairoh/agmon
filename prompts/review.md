@@ -36,7 +36,9 @@ that is itself a finding — report it and review anyway.
    recommend a resolution, change nothing.
 5. **One commit at the end** (your tests + REVIEW.md). The suite must be
    green after it, your xfails XFAILing.
-
+6. **test-honesty spot check**  pick two feature tests, temporarily stub or
+   revert the code they cover, confirm each fails for the stated reason,
+   then restore
 ## Resources
 
 - The primary spec under review is named in FOCUS; absent that, it is

@@ -86,7 +86,12 @@ Testing:
   connection or override an Ingester method), not `conn.execute = ...`.
 - Verify reviewer-reported test results by running the suite; don't trust
   "passes"/"green" claims unrun.
-
+- Feature work is test-first. For each spec'd behavior, write the test
+  from the spec before implementing it, run it, observe it fail for the
+  right reason, then implement to green. A test that has never failed
+  is evidence of nothing. Suites must cover failure and edge cases, not
+  only the happy path — every behavior gets at least one hostile test.
+  Tests assert the contract (spec/README), not implementation internals.
 ## Run conventions (every dispatched task)
 
 - Commit as you go, in logical units, plain imperative messages. Work
