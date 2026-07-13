@@ -144,6 +144,26 @@ def cmd_show(args, ctx: Ctx) -> int:
     return 0
 
 
+def cmd_artifacts(args, ctx: Ctx) -> int:
+    # --get streams raw content to stdout (pipeable); its errors go to stderr
+    # with exit 1, distinct from the table path's generic ClientError handling.
+    if args.get is not None:
+        try:
+            run_id = resolve(ctx.client.all_runs(), args.id)
+            content = ctx.client.get_artifact_content(run_id, args.get)
+        except ClientError as exc:
+            ctx.err.write(f"agmon: {exc}\n")
+            return 1
+        ctx.out.write(content)
+        return 0
+    run_id = resolve(ctx.client.all_runs(), args.id)
+    catalog = ctx.client.get_artifacts(run_id)
+    return _tabular(
+        ctx, args, catalog,
+        lambda: render.artifacts_rows(catalog), json_payload=catalog,
+    )
+
+
 def cmd_events(args, ctx: Ctx) -> int:
     run_id = ctx.client.resolve_run_id(args.id)
     resp = ctx.client.get_events(
@@ -291,6 +311,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="start N events from the end instead of the beginning")
     p_tail.add_argument("--plain", action="store_true", help="no color")
     p_tail.set_defaults(func=cmd_tail)
+
+    p_artifacts = sub.add_parser(
+        "artifacts", parents=[view_parent], help="list/fetch a run's named artifacts"
+    )
+    p_artifacts.add_argument("id", nargs="?", default=None,
+                             help="run id (substring); default latest")
+    p_artifacts.add_argument("--get", default=None, metavar="NAME",
+                             help="print one artifact's content raw to stdout")
+    p_artifacts.set_defaults(func=cmd_artifacts)
 
     p_events = sub.add_parser("events", parents=[view_parent], help="raw event forensics")
     p_events.add_argument("id", nargs="?", default=None, help="run id (substring); default latest")

@@ -175,6 +175,23 @@ class Client:
             params["errors_only"] = "true"
         return self._get(f"/v1/runs/{run_id}/events", params)
 
+    def get_artifacts(self, run_id: str) -> list[dict]:
+        """The run's artifact catalog (dispatch + section + file rows)."""
+        return self._get(f"/v1/runs/{run_id}/artifacts")["artifacts"]
+
+    def get_artifact_content(self, run_id: str, name: str) -> str:
+        """Raw artifact content as text. Raises ``ClientError`` (with the
+        server's error/reason) on 4xx — the content endpoint returns
+        ``text/plain``, not JSON, so this bypasses the JSON ``_get`` path."""
+        url = self.base_url + f"/v1/runs/{run_id}/artifacts/content"
+        try:
+            resp = self._http.get(url, params={"name": name})
+        except httpx.HTTPError as exc:
+            raise ClientError(f"cannot reach {self.base_url}: {exc}") from exc
+        if resp.status_code >= 400:
+            raise APIError(resp.status_code, _error_detail(resp))
+        return resp.text
+
     def get_costs(
         self, *, since: str | None = None, until: str | None = None
     ) -> dict:

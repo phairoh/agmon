@@ -203,6 +203,94 @@ def test_tail_died_via_status_exit_3():
     assert code == 3
 
 
+# -- artifacts ---------------------------------------------------------------
+
+CATALOG = [
+    {"name": "prompt", "kind": "dispatch", "available": True, "bytes": 42},
+    {"name": "prompt.overrides", "kind": "section", "available": True, "bytes": 13},
+    {"name": "result", "kind": "dispatch", "available": False,
+     "reason": "run produced no result"},
+    {"name": "/wt/REVIEW.md", "kind": "file", "available": True, "bytes": 100,
+     "path": "/wt/REVIEW.md", "ops": 1, "first_op": "write", "last_seq": 5,
+     "reconstructable": True},
+]
+
+
+class ArtifactsStub:
+    def __init__(self, catalog=CATALOG, contents=None):
+        self._catalog = catalog
+        self._contents = contents or {
+            "REVIEW.md": "the review text",
+            "prompt.overrides": "override body",
+        }
+        self.requested = []
+
+    def all_runs(self):
+        return RUN_ITEMS
+
+    def get_artifacts(self, run_id):
+        return self._catalog
+
+    def get_artifact_content(self, run_id, name):
+        self.requested.append(name)
+        if name not in self._contents:
+            from agmon.client import ClientError
+            raise ClientError(f"no artifact named {name!r}")
+        return self._contents[name]
+
+
+def test_artifacts_table_lists_names_and_kinds():
+    code, out, _ = run_cli(["artifacts"], ArtifactsStub(), tty=False)
+    assert code == 0
+    assert "prompt" in out
+    assert "prompt.overrides" in out
+    assert "/wt/REVIEW.md" in out
+    assert "dispatch" in out and "section" in out and "file" in out
+    # header carries the four spec'd columns
+    header = out.splitlines()[0].split("\t")
+    assert header == ["name", "kind", "available", "size"]
+
+
+def test_artifacts_get_review_by_basename():
+    stub = ArtifactsStub()
+    code, out, err = run_cli(["artifacts", "--get", "REVIEW.md"], stub, tty=False)
+    assert code == 0
+    assert out == "the review text"  # raw, no decoration or added newline
+    assert err == ""
+    assert stub.requested == ["REVIEW.md"]
+
+
+def test_artifacts_get_prompt_overrides():
+    stub = ArtifactsStub()
+    code, out, _ = run_cli(["artifacts", "--get", "prompt.overrides"], stub, tty=False)
+    assert code == 0
+    assert out == "override body"
+
+
+def test_artifacts_get_error_to_stderr_exit_1():
+    stub = ArtifactsStub()
+    code, out, err = run_cli(["artifacts", "--get", "nope"], stub, tty=False)
+    assert code == 1
+    assert out == ""
+    assert "nope" in err
+
+
+def test_show_renders_decisions_before_result():
+    summary = dict(SUMMARY)
+    summary["decisions"] = "chose A over B"
+    summary["result_text"] = "final result body"
+
+    class ShowStub(StubClient):
+        def get_summary(self, run_id):
+            return summary
+
+    code, out, _ = run_cli(["show"], ShowStub(), tty=False)
+    assert code == 0
+    assert "chose A over B" in out
+    # Decisions section is rendered before the Result section
+    assert out.index("chose A over B") < out.index("final result body")
+
+
 # -- run passthrough smoke ---------------------------------------------------
 
 
