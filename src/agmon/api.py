@@ -9,9 +9,9 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-from . import db, derive
+from . import artifacts, db, derive
 from .config import Config
 from .ingest import Ingester, now_iso
 
@@ -288,6 +288,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         run["labels"] = labels
         run["prompt"] = row["prompt"]
         run["meta_json"] = json.loads(row["meta_json"]) if row["meta_json"] else None
+        result_text = derive.derive_result_text(events)
         return {
             "run": run,
             "status": derive.derive_status(
@@ -296,9 +297,49 @@ def create_app(config: Config | None = None) -> FastAPI:
             "activity": derive.derive_activity(events),
             "issues": derive.derive_issues(events),
             "metrics": derive.derive_metrics(run, events, now),
-            "result_text": derive.derive_result_text(events),
+            "result_text": result_text,
+            "decisions": artifacts.derive_section(result_text, "DECISIONS"),
             "lineage": lineage,
         }
+
+    @app.get("/v1/runs/{run_id}/artifacts")
+    def get_artifacts(run_id: str):
+        with read() as conn:
+            row = conn.execute(
+                _RUN_SELECT + " WHERE r.run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return JSONResponse({"error": "unknown run_id"}, status_code=404)
+            events = _load_events(conn, run_id)
+        result_text = derive.derive_result_text(events)
+        catalog = artifacts.build_catalog(row["prompt"], result_text, events)
+        return {"artifacts": catalog}
+
+    @app.get("/v1/runs/{run_id}/artifacts/content")
+    def get_artifact_content(run_id: str, name: str = Query(...)):
+        with read() as conn:
+            row = conn.execute(
+                _RUN_SELECT + " WHERE r.run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return JSONResponse({"error": "unknown run_id"}, status_code=404)
+            events = _load_events(conn, run_id)
+        result_text = derive.derive_result_text(events)
+        try:
+            content = artifacts.resolve_content(
+                row["prompt"], result_text, events, name
+            )
+        except artifacts.ArtifactUnavailable as exc:
+            return JSONResponse(
+                {"error": str(exc), "reason": exc.reason}, status_code=409
+            )
+        except artifacts.ArtifactAmbiguous as exc:
+            return JSONResponse(
+                {"error": str(exc), "candidates": exc.candidates}, status_code=400
+            )
+        except artifacts.ArtifactUnknown as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        return PlainTextResponse(content, media_type="text/plain; charset=utf-8")
 
     @app.get("/v1/runs/{run_id}/events")
     def get_events(

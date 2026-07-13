@@ -165,7 +165,11 @@ def main(argv: list[str] | None = None) -> None:
         "argv": cmd[:1] + ["<prompt omitted>"] + cmd[3:],  # avoid duplicating long prompts
         "cwd": str(cwd),
         "git": git_info(cwd),
-        "model": args.model,
+        # The --model *argument* is intent, not observation: record it as
+        # model_requested (additive spool-contract field). The `model` column is
+        # harvested from the init event at ingest time (spec §6); the wrapper no
+        # longer writes meta `model`.
+        "model_requested": args.model,
         "permission_mode": args.permission_mode,
         "host": os.uname().nodename,
         "session_id": None,

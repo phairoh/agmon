@@ -21,12 +21,15 @@ log = logging.getLogger("agmon.ingest")
 
 # Meta fields that get their own column. `git` is nested and handled separately;
 # everything (including unlisted fields) is also kept verbatim in meta_json.
+# `model` is deliberately NOT here: it is *observed* (harvested from the init
+# event in _ingest_events), never taken from meta — intent is not observation.
+# Keeping it out of the meta upsert also means a later meta rewrite can't clobber
+# the harvested value.
 _META_COLUMNS = (
     "run_id",
     "session_id",
     "prompt",
     "cwd",
-    "model",
     "host",
     "pid",
     "started_at",
@@ -235,6 +238,7 @@ class Ingester:
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE run_id=?", (run_id,)
         ).fetchone()[0]
         rows = []
+        init_model: str | None = None
         for raw in chunk.split(b"\n"):
             if not raw.strip():
                 continue
@@ -248,6 +252,11 @@ class Ingester:
             if isinstance(obj, dict):
                 typ = _as_str_or_none(obj.get("type"))
                 sub = _as_str_or_none(obj.get("subtype"))
+                # The init system event carries the *observed* resolved model.
+                if typ == "system" and sub == "init":
+                    m = _as_str_or_none(obj.get("model"))
+                    if m is not None:
+                        init_model = m
             else:
                 typ, sub = None, None
             rows.append((run_id, seq, typ, sub, text, int(_is_error_event(obj))))
@@ -263,6 +272,13 @@ class Ingester:
                     "(run_id, seq, ingested_at, type, subtype, payload, is_error) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [(r[0], r[1], ingested_at, r[2], r[3], r[4], r[5]) for r in rows],
+                )
+            # Harvest the observed model from the init event (present only in the
+            # first chunk); leave it untouched otherwise so it stays null until
+            # observed and is never reset by later chunks.
+            if init_model is not None:
+                self.conn.execute(
+                    "UPDATE runs SET model = ? WHERE run_id = ?", (init_model, run_id)
                 )
             self.conn.execute(
                 "INSERT INTO ingest_state (path, run_id, byte_off, meta_mtime) "
