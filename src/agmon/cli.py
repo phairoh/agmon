@@ -170,6 +170,22 @@ def cmd_costs(args, ctx: Ctx) -> int:
     )
 
 
+def cmd_artifacts(args, ctx: Ctx) -> int:
+    run_id = ctx.client.resolve_run_id(args.id)
+    if args.get is not None:
+        try:
+            content = ctx.client.get_artifact_content(run_id, args.get)
+        except ClientError as exc:
+            ctx.err.write(f"agmon: {exc}\n")
+            return 1
+        ctx.out.write(content)
+        return 0
+    items = ctx.client.get_artifacts(run_id).get("artifacts", [])
+    return _tabular(
+        ctx, args, items, lambda: render.artifacts_rows(items), json_payload=items,
+    )
+
+
 def cmd_tail(args, ctx: Ctx) -> int:
     run_id = ctx.client.resolve_run_id(args.id)
     cursor = 0
@@ -284,6 +300,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("--full-prompt", action="store_true", help="show the whole prompt")
     p_show.add_argument("--raw", action="store_true", help="do not render result as markdown")
     p_show.set_defaults(func=cmd_show)
+
+    p_artifacts = sub.add_parser(
+        "artifacts", parents=[view_parent], help="artifact catalog for a run"
+    )
+    p_artifacts.add_argument("id", nargs="?", default=None, help="run id (substring); default latest")
+    p_artifacts.add_argument(
+        "--get", default=None, metavar="NAME",
+        help="fetch one artifact's content to stdout (e.g. --get REVIEW.md)",
+    )
+    p_artifacts.set_defaults(func=cmd_artifacts)
 
     p_tail = sub.add_parser("tail", parents=[url_parent], help="live follow a run")
     p_tail.add_argument("id", nargs="?", default=None, help="run id (substring); default latest")

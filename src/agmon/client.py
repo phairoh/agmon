@@ -175,6 +175,24 @@ class Client:
             params["errors_only"] = "true"
         return self._get(f"/v1/runs/{run_id}/events", params)
 
+    def get_artifacts(self, run_id: str) -> dict:
+        return self._get(f"/v1/runs/{run_id}/artifacts")
+
+    def get_artifact_content(self, run_id: str, name: str) -> str:
+        """The raw text of one artifact. Raises ``APIError`` on 404 (unknown),
+        409 (listed but unavailable), or 400 (ambiguous fragment) — the
+        server's ``error`` field becomes the exception message."""
+        try:
+            resp = self._http.get(
+                self.base_url + f"/v1/runs/{run_id}/artifacts/content",
+                params={"name": name},
+            )
+        except httpx.HTTPError as exc:
+            raise ClientError(f"cannot reach {self.base_url}: {exc}") from exc
+        if resp.status_code >= 400:
+            raise APIError(resp.status_code, _error_detail(resp))
+        return resp.text
+
     def get_costs(
         self, *, since: str | None = None, until: str | None = None
     ) -> dict:

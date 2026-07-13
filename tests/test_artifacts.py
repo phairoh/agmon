@@ -560,3 +560,123 @@ def test_summary_decisions_null_when_absent(env):
 
     resp = client.get(f"/v1/runs/{run_id}/summary")
     assert resp.json()["decisions"] is None
+
+
+# ============================================================================
+# 4. CLI — agmon artifacts / --get / show Decisions section
+# ============================================================================
+
+import io  # noqa: E402
+
+from agmon import cli  # noqa: E402
+from agmon.client import APIError  # noqa: E402
+
+ARTIFACT_ITEMS = [
+    {"name": "prompt", "kind": "dispatch", "available": True, "bytes": 42},
+    {"name": "prompt.focus", "kind": "section", "available": True, "bytes": 10},
+    {"name": "prompt.overrides", "kind": "section", "available": False, "reason": "OVERRIDES marker not present"},
+    {"name": "result", "kind": "dispatch", "available": True, "bytes": 20},
+    {"name": "result.decisions", "kind": "section", "available": True, "bytes": 17},
+    {"name": "/worktree/REVIEW.md", "kind": "file", "available": True, "bytes": 30, "path": "/worktree/REVIEW.md"},
+]
+
+
+class ArtifactsStub:
+    def __init__(self, artifacts_list=ARTIFACT_ITEMS, contents=None, content_error=None):
+        self._artifacts = artifacts_list
+        self._contents = contents or {}
+        self._content_error = content_error
+        self.requested_names = []
+
+    def resolve_run_id(self, fragment):
+        return "20260709T000000-a3f9c1"
+
+    def get_artifacts(self, run_id):
+        return {"artifacts": self._artifacts}
+
+    def get_artifact_content(self, run_id, name):
+        self.requested_names.append(name)
+        if self._content_error is not None:
+            raise self._content_error
+        return self._contents[name]
+
+
+def _run_cli(argv, client, *, tty=False):
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(argv, client=client, out=out, err=err, tty=tty, now=None,
+                    sleep=lambda *_: None)
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_cli_artifacts_table():
+    code, out, _ = _run_cli(["artifacts"], ArtifactsStub(), tty=False)
+    assert code == 0
+    header = out.splitlines()[0].split("\t")
+    assert header == cli.render.ARTIFACTS_HEADERS
+    assert "prompt.overrides" in out
+    assert "/worktree/REVIEW.md" in out
+
+
+def test_cli_artifacts_get_dispatch_form():
+    stub = ArtifactsStub(contents={"prompt.overrides": "ignore Y"})
+    code, out, err = _run_cli(["artifacts", "--get", "prompt.overrides"], stub, tty=False)
+    assert code == 0
+    assert out == "ignore Y"
+    assert err == ""
+    assert stub.requested_names == ["prompt.overrides"]
+
+
+def test_cli_artifacts_get_review_md_form():
+    stub = ArtifactsStub(contents={"REVIEW.md": "# Review\n\nlooks good\n"})
+    code, out, _ = _run_cli(["artifacts", "--get", "REVIEW.md"], stub, tty=False)
+    assert code == 0
+    assert out == "# Review\n\nlooks good\n"
+
+
+def test_cli_artifacts_get_error_to_stderr_exit_1():
+    stub = ArtifactsStub(content_error=APIError(404, "unknown artifact: 'nope'"))
+    code, out, err = _run_cli(["artifacts", "--get", "nope"], stub, tty=False)
+    assert code == 1
+    assert out == ""
+    assert "nope" in err
+
+
+# -- show Decisions section ---------------------------------------------------
+
+
+class DecisionsShowStub:
+    def __init__(self, summary):
+        self._summary = summary
+
+    def all_runs(self):
+        return [{"run_id": "20260709T115700-a3f9c1", "session_id": None,
+                  "started_at": "2026-07-09T11:57:00+00:00"}]
+
+    def get_summary(self, run_id):
+        return self._summary
+
+
+_DECISIONS_SUMMARY = {
+    "run": {"run_id": "20260709T115700-a3f9c1", "session_id": None,
+            "started_at": "2026-07-09T11:57:00+00:00", "prompt": "hi"},
+    "status": {"effective_status": "finished", "stalled_seconds": None},
+    "activity": {"last_tool": None, "last_text": None, "progress": None},
+    "issues": [], "metrics": {},
+    "result_text": "the answer is 42",
+    "decisions": "picked approach A because it was simplest",
+    "lineage": None,
+}
+
+
+def test_show_renders_decisions_before_result():
+    stub = DecisionsShowStub(_DECISIONS_SUMMARY)
+    _, out, _ = _run_cli(["show", "a3f9c1"], stub, tty=False)
+    assert "picked approach A because it was simplest" in out
+    assert out.index("picked approach A") < out.index("the answer is 42")
+
+
+def test_show_omits_decisions_when_absent():
+    summary = dict(_DECISIONS_SUMMARY, decisions=None)
+    stub = DecisionsShowStub(summary)
+    _, out, _ = _run_cli(["show", "a3f9c1"], stub, tty=False)
+    assert "picked approach" not in out

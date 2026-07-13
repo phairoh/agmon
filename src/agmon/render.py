@@ -396,6 +396,27 @@ def costs_rows(body: dict) -> tuple[list[str], list[list]]:
     return COSTS_HEADERS, rows
 
 
+# -- artifacts -----------------------------------------------------------------
+
+ARTIFACTS_HEADERS = ["name", "kind", "available", "size"]
+
+
+def artifacts_rows(items: list[dict]) -> tuple[list[str], list[list]]:
+    rows = []
+    for it in items:
+        available = bool(it.get("available"))
+        size = it.get("bytes")
+        rows.append(
+            [
+                it.get("name"),
+                it.get("kind"),
+                Styled("yes", "green") if available else Styled("no", "dim"),
+                str(size) if size is not None else "-",
+            ]
+        )
+    return ARTIFACTS_HEADERS, rows
+
+
 # -- show --------------------------------------------------------------------
 
 
@@ -512,6 +533,12 @@ def show_renderables(
         snip = truncate(_oneline(iss.get("snippet") or ""), 100)
         label = f"  [{cat}]" + (f" {tool}" if tool else "") + f": {snip}"
         out.append(Text(label, style="red"))
+
+    # decisions (rendered like result, placed before it)
+    decisions = summary.get("decisions")
+    if decisions:
+        out.append(Text("\ndecisions:", style="dim"))
+        out.append(Text(decisions) if raw else Markdown(decisions))
 
     # result text
     result_text = summary.get("result_text")
