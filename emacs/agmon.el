@@ -57,14 +57,21 @@ Defaults to the AGMON_URL environment variable, or
   :type 'string
   :group 'agmon)
 
-(defcustom agmon-list-columns '(id status phase cwd age cost task)
+(defcustom agmon-list-columns
+  '(id status
+    age started runtime
+    cwd model
+    pipeline phase
+    cost labels)
   "Columns shown in the run list, left to right.
 Each symbol names a column defined in `agmon--column-specs'.  This one
 list controls both order and visibility: reorder it to reorder the
 columns, and drop a symbol to hide that column (say, `cost').  After
 changing it, run \\[agmon] to rebuild the list with the new layout.
 
-Available columns: `id', `status', `cwd', `age', `cost', `task'."
+Available columns are the keys of `agmon--column-specs': `id',
+`status', `model', `cwd', `age', `started', `runtime', `cost',
+`pipeline', `phase', `parent', `labels', `task'."
   :type '(repeat symbol)
   :group 'agmon)
 
@@ -268,13 +275,12 @@ final dash is the part an operator recognizes."
     run-id))
 
 (defun agmon--abbrev-path (path)
-  "Abbreviate PATH to its final two components for compact display.
-\"/home/aaron/src/agmon\" becomes \".../src/agmon\"; shorter paths
-are returned unchanged."
+  "Abbreviate PATH to its final component for compact display.
+\"/home/aaron/src/agmon\" becomes \"agmon\"; a fleet whose runs all
+live under one parent shows only the part that differs.  An empty PATH
+is returned unchanged."
   (let ((parts (split-string (directory-file-name path) "/" t)))
-    (if (> (length parts) 2)
-        (concat ".../" (string-join (last parts 2) "/"))
-      path)))
+    (if parts (car (last parts)) path)))
 
 (defun agmon--parse-time (iso)
   "Parse ISO-8601 string ISO to an Emacs time value, or nil on failure."
@@ -308,6 +314,19 @@ consistently and sorts by recency.  NOW is an Emacs time value."
       (when start
         (max 0 (floor (float-time (time-subtract now start))))))))
 
+(defun agmon--run-duration-seconds (run now)
+  "Return RUN's elapsed run time in seconds as of NOW, or nil if unknown.
+Run time is `started_at' to `ended_at' once the run has ended, else to
+NOW so a live run's time ticks up.  Distinct from age
+\(`agmon--run-age-seconds'), which is always time-since-start: a run
+that finished an hour ago keeps its true run time here but grows older
+there."
+  (let-alist run
+    (let ((start (agmon--parse-time .started_at)))
+      (when start
+        (let ((end (or (agmon--parse-time .ended_at) now)))
+          (max 0 (floor (float-time (time-subtract end start)))))))))
+
 (defun agmon--cell-sort-value (cell)
   "Return the numeric `agmon-sort' text property carried on CELL, or 0.
 CELL is a tabulated-list cell: a (propertized) string, or a
@@ -327,22 +346,32 @@ lexicographic order of their rendered text."
        (agmon--cell-sort-value (aref (cadr b) col)))))
 
 (defconst agmon--column-specs
-  '((id     :name "Id"     :width 8  :sort t)
-    (status :name "Status" :width 11 :sort t)
-    (cwd    :name "Cwd"    :width 20 :sort t)
-    (age    :name "Age"    :width 6  :numeric t :right-align t)
-    (cost   :name "Cost"   :width 7  :numeric t :right-align t)
-    (phase  :name "Phase"  :width 11 :sort t)
-    (labels :name "Labels" :width 24)
-    (task   :name "Task"   :width 44))
+  '((id       :name "Id"       :width 8  :sort t)
+    (status   :name "Status"   :width 11 :sort t)
+    (model    :name "Model"    :width 8  :sort t)
+    (cwd      :name "Cwd"      :width 20 :sort t)
+    (age      :name "Age"      :width 6  :numeric t :right-align t)
+    (started  :name "Started"  :width 11 :sort t)
+    (runtime  :name "Runtime"  :width 8  :numeric t :right-align t)
+    (cost     :name "Cost"     :width 7  :numeric t :right-align t)
+    (pipeline :name "Pipeline" :width 16 :sort t :label pipeline)
+    (phase    :name "Phase"    :width 11 :sort t :label phase)
+    (parent   :name "Parent"   :width 8  :sort t :label parent :short-id t)
+    (labels   :name "Labels"   :width 24)
+    (task     :name "Task"     :width 44))
   "Registry of every run-list column, keyed by symbol.
 Each entry is (KEY :name NAME :width W [:sort t] [:numeric t]
-[:right-align t]).  `agmon-list-columns' selects which of these to
-show and in what order; `agmon--run-cell' renders each KEY's cell.
-A `:numeric' column sorts by a stashed number (see
-`agmon--numeric-sorter') rather than by its rendered text.
-`phase' and `labels' read a run's labels; a pipeline-filtered list adds
-`phase' automatically (see `agmon-list-pipeline').")
+[:right-align t] [:label LKEY] [:short-id t]).  `agmon-list-columns'
+selects which of these to show and in what order; `agmon--run-cell'
+renders each KEY's cell.  A `:numeric' column sorts by a stashed number
+\(see `agmon--numeric-sorter') rather than by its rendered text.  A
+`:label' column reads the run label named LKEY (the reserved lineage
+labels pipeline/phase/parent) instead of a top-level field, and
+`:short-id' renders a run-id-valued label as its memorable tail.  The
+generic `labels' column then omits every label already promoted to its
+own column, so nothing is shown twice (see `agmon--unpromoted-labels').
+A pipeline-filtered list adds `phase' automatically (see
+`agmon-list-pipeline').")
 
 (defun agmon--labels-cell (labels)
   "Render alist LABELS as a compact \"k=v,k=v\" string, keys sorted; \"\" if none."
@@ -355,27 +384,58 @@ A `:numeric' column sorts by a stashed number (see
        ",")
     ""))
 
+(defun agmon--promoted-label-keys ()
+  "Return the label keys shown as their own column in `agmon-list-columns'.
+These are the LKEY of every displayed column whose spec carries a
+`:label' (see `agmon--column-specs').  `agmon--unpromoted-labels'
+subtracts them so the `labels' column never repeats a label that is
+already promoted to a column of its own."
+  (delq nil
+        (mapcar (lambda (col)
+                  (plist-get (alist-get col agmon--column-specs) :label))
+                agmon-list-columns)))
+
+(defun agmon--unpromoted-labels (labels)
+  "Return alist LABELS with every key promoted to its own column removed.
+The remainder is what the generic `labels' column shows.  See
+`agmon--promoted-label-keys'."
+  (let ((promoted (agmon--promoted-label-keys)))
+    (seq-remove (lambda (kv) (memq (car kv) promoted)) labels)))
+
 (defun agmon--run-cell (key run now)
   "Render the cell for column KEY of RUN, as of time NOW.
 Returns a possibly-propertized string.  KEY is one of the keys in
 `agmon--column-specs'.  Status carries a face; the numeric columns
-carry an invisible `agmon-sort' property holding their raw value."
+carry an invisible `agmon-sort' property holding their raw value.  A
+column whose spec carries `:label' reads that label from RUN (short-id
+first when `:short-id'); the `labels' column shows only labels not
+already promoted to a column of their own."
   (let-alist run
     (pcase key
       ('id (agmon--short-id .run_id))
       ('status (let ((s (or .effective_status "")))
                  (propertize s 'face (agmon--status-face s))))
+      ('model (or .model ""))
       ('cwd (agmon--abbrev-path (or .cwd "")))
       ('age (let ((start (agmon--parse-time .started_at)))
               (propertize (agmon--format-age (agmon--run-age-seconds run now))
                           'agmon-sort (if start (float-time start) 0))))
+      ('runtime (let ((secs (agmon--run-duration-seconds run now)))
+                  (propertize (agmon--format-age secs) 'agmon-sort (or secs 0))))
+      ('started (let ((tm (agmon--parse-time .started_at)))
+                  (if tm (format-time-string "%Y-%m-%d" tm) "")))
       ('cost (propertize (agmon--format-cost .total_cost_usd)
                          'agmon-sort (if (numberp .total_cost_usd)
                                          .total_cost_usd 0)))
-      ('phase (or (alist-get 'phase .labels) ""))
-      ('labels (agmon--truncate (agmon--labels-cell .labels) 40))
+      ('labels (agmon--truncate
+                (agmon--labels-cell (agmon--unpromoted-labels .labels)) 40))
       ('task (agmon--truncate (agmon--oneline (or .prompt_preview "")) 100))
-      (_ ""))))
+      (_ (let* ((spec (alist-get key agmon--column-specs))
+                (lkey (plist-get spec :label)))
+           (if lkey
+               (let ((val (or (alist-get lkey .labels) "")))
+                 (if (plist-get spec :short-id) (agmon--short-id val) val))
+             ""))))))
 
 (defun agmon--run-entry (run &optional now)
   "Build a `tabulated-list' entry from RUN, an alist for one run.

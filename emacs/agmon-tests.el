@@ -61,10 +61,11 @@
   (should (equal (agmon--short-id "plain") "plain")))
 
 (ert-deftest agmon-test-abbrev-path ()
-  "`agmon--abbrev-path' keeps the final two path components."
-  (should (equal (agmon--abbrev-path "/home/aaron/src/agmon") ".../src/agmon"))
-  (should (equal (agmon--abbrev-path "src/agmon") "src/agmon"))
-  (should (equal (agmon--abbrev-path "/only") "/only")))
+  "`agmon--abbrev-path' keeps only the final path component."
+  (should (equal (agmon--abbrev-path "/home/aaron/src/agmon") "agmon"))
+  (should (equal (agmon--abbrev-path "src/agmon") "agmon"))
+  (should (equal (agmon--abbrev-path "/only") "only"))
+  (should (equal (agmon--abbrev-path "") "")))
 
 (ert-deftest agmon-test-oneline ()
   "`agmon--oneline' collapses whitespace runs and trims."
@@ -106,10 +107,12 @@
 
 (ert-deftest agmon-test-run-cell ()
   "`agmon--run-cell' renders each column from a run alist."
-  (let ((now (current-time)))
+  ;; With no label promoted to its own column, `labels' shows them all.
+  (let ((now (current-time))
+        (agmon-list-columns '(id status cwd age cost labels task)))
     (should (equal (agmon--run-cell 'id agmon-test--run now) "efb89a"))
     (should (equal (agmon--run-cell 'status agmon-test--run now) "running"))
-    (should (equal (agmon--run-cell 'cwd agmon-test--run now) ".../src/agmon"))
+    (should (equal (agmon--run-cell 'cwd agmon-test--run now) "agmon"))
     (should (equal (agmon--run-cell 'phase agmon-test--run now) "test"))
     (should (equal (agmon--run-cell 'labels agmon-test--run now)
                    "phase=test,pipeline=build"))
@@ -118,6 +121,75 @@
       (should (equal cost "$1.50"))
       ;; Numeric columns stash their raw value for value-based sorting.
       (should (= (get-text-property 0 'agmon-sort cost) 1.5)))))
+
+(defconst agmon-test--labelled-run
+  '((run_id . "20260713T172231-2c9e67")
+    (model . "opus")
+    (labels . ((pipeline . "artifacts-006")
+               (phase . "build")
+               (parent . "20260709T090000-abc123")
+               (experiment . "ab"))))
+  "A run carrying a model field and the reserved lineage labels.")
+
+(ert-deftest agmon-test-run-cell-label-columns ()
+  "Label-backed columns read their label; `model' is a field; parent short-ids."
+  (should (equal (agmon--run-cell 'model agmon-test--labelled-run nil) "opus"))
+  (should (equal (agmon--run-cell 'pipeline agmon-test--labelled-run nil)
+                 "artifacts-006"))
+  (should (equal (agmon--run-cell 'phase agmon-test--labelled-run nil) "build"))
+  ;; `parent' is a run id, rendered as its memorable tail.
+  (should (equal (agmon--run-cell 'parent agmon-test--labelled-run nil) "abc123"))
+  ;; A null/absent field or label renders as the empty string, never nil.
+  (should (equal (agmon--run-cell 'model '((run_id . "x")) nil) ""))
+  (should (equal (agmon--run-cell 'parent '((run_id . "x")) nil) "")))
+
+(ert-deftest agmon-test-labels-column-excludes-promoted ()
+  "The `labels' column omits any label promoted to its own column."
+  (let ((labels (alist-get 'labels agmon-test--labelled-run)))
+    ;; No label column shown: every label survives.
+    (let ((agmon-list-columns '(id labels)))
+      (should-not (agmon--promoted-label-keys))
+      (should (equal (agmon--labels-cell (agmon--unpromoted-labels labels))
+                     "experiment=ab,parent=20260709T090000-abc123,\
+phase=build,pipeline=artifacts-006")))
+    ;; Promote pipeline, phase, parent: only the leftover label remains.
+    (let ((agmon-list-columns '(id pipeline phase parent labels)))
+      (should (equal (agmon--promoted-label-keys) '(pipeline phase parent)))
+      (should (equal (agmon--unpromoted-labels labels) '((experiment . "ab"))))
+      ;; End to end through the cell: the leftover fits, so no truncation.
+      (should (equal (agmon--run-cell 'labels agmon-test--labelled-run nil)
+                     "experiment=ab")))))
+
+(ert-deftest agmon-test-run-duration-seconds ()
+  "`agmon--run-duration-seconds' spans start->end, or start->now while live."
+  ;; Finished: ended_at pins the run time regardless of NOW.
+  (let ((run '((started_at . "2026-07-10T01:00:00Z")
+               (ended_at . "2026-07-10T01:15:30Z")))
+        (now (agmon--parse-time "2026-07-11T00:00:00Z")))
+    (should (= (agmon--run-duration-seconds run now) 930)))
+  ;; Live: no ended_at, so it ticks against NOW.
+  (let ((run '((started_at . "2026-07-10T01:00:00Z")))
+        (now (agmon--parse-time "2026-07-10T01:02:00Z")))
+    (should (= (agmon--run-duration-seconds run now) 120)))
+  ;; Unknown start -> nil, not an error.
+  (should-not (agmon--run-duration-seconds '((cwd . "/x")) (current-time))))
+
+(ert-deftest agmon-test-run-cell-runtime ()
+  "The `runtime' cell renders the duration and stashes it for sorting."
+  (let* ((run '((started_at . "2026-07-10T01:00:00Z")
+                (ended_at . "2026-07-10T03:13:00Z")))
+         (now (agmon--parse-time "2026-07-11T00:00:00Z"))
+         (cell (agmon--run-cell 'runtime run now)))
+    (should (equal (substring-no-properties cell) "2h13m"))
+    (should (= (get-text-property 0 'agmon-sort cell) 7980))))
+
+(ert-deftest agmon-test-run-cell-started ()
+  "The `started' cell renders the local calendar date, empty when unknown."
+  (let ((cell (agmon--run-cell 'started
+                               '((started_at . "2026-07-10T01:24:16Z")) nil)))
+    ;; Timezone-independent shape check: a bare YYYY-MM-DD date.
+    (should (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'" cell)))
+  (should (equal (agmon--run-cell 'started '((cwd . "/x")) nil) "")))
 
 (ert-deftest agmon-test-run-cell-status-face ()
   "The status cell carries the per-status face."
