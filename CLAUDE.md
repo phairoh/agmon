@@ -3,7 +3,12 @@
 Code and README are authoritative; this file is memory, not spec.
 
 - `specs/` holds historical task specs: what was built then, not what is true
-  now. Never treat them as current — the code and README win.
+  now. Never treat them as current — the code and README win. Specs are frozen
+  once accepted; never amend one.
+- `decisions/` holds per-spec judgment ledgers from attended tutored builds
+  (process: `.claude/skills/tutored-build/`) — append-only divergence claims,
+  with transcript citations, for a future attended-review to verify. Never
+  rewrite or delete entries; spec divergence goes here, not into the spec.
 - `notes/friction.md` is the shared friction log — rough edges in the API,
   tooling, or workflow that a client bumps into (operator or agent; the
   friction is the same either way). Append to it liberally as you hit things;
@@ -86,12 +91,11 @@ Testing:
   connection or override an Ingester method), not `conn.execute = ...`.
 - Verify reviewer-reported test results by running the suite; don't trust
   "passes"/"green" claims unrun.
-- Feature work is test-first. For each spec'd behavior, write the test
-  from the spec before implementing it, run it, observe it fail for the
-  right reason, then implement to green. A test that has never failed
-  is evidence of nothing. Suites must cover failure and edge cases, not
-  only the happy path — every behavior gets at least one hostile test.
-  Tests assert the contract (spec/README), not implementation internals.
+- Dispatched (unattended) feature work is test-first: write each behavior's
+  test from the spec, watch it fail for the right reason, then implement to
+  green; cover failure and edge cases, assert the contract (spec/README) not
+  internals. Attended tutored builds are exempt — the operator verifies live,
+  so tests may follow the code.
 ## Run conventions (every dispatched task)
 
 - Commit as you go, in logical units, plain imperative messages. Work
