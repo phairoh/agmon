@@ -59,6 +59,57 @@ and `parent` (a run_id, the causal edge). Derivation reads these to build the
 `pipeline`). This pipeline lineage is distinct from resume-chain lineage
 (shared `session_id`); the two are never conflated.
 
+### The artifact catalog
+
+Runs produce durable artifacts that git deliberately forgets: a review file
+gets consumed and deleted, a DECISIONS writeup lives only in the run's final
+message, the fully-composed prompt (including any appended FOCUS/OVERRIDES
+sections) exists only in meta. The spool still has all of it — the artifact
+catalog surfaces it as named things you can list and fetch without knowing
+file paths or parsing prose yourself.
+
+Every run exposes two families of artifacts:
+
+| name               | kind       | source                            | present when          |
+| ------------------ | ---------- | ---------------------------------- | ---------------------- |
+| `prompt`            | `dispatch` | the stored composed prompt         | always (may be unavailable if none was recorded) |
+| `prompt.focus`      | `section`  | `FOCUS` section parsed from prompt | marker present         |
+| `prompt.overrides`  | `section`  | `OVERRIDES` section from prompt    | marker present         |
+| `result`            | `dispatch` | the run's result text              | run produced a result  |
+| `result.decisions`  | `section`  | `DECISIONS` section from result    | marker present         |
+| `<file path>`       | `file`     | reconstructed from Write/Edit tool calls | the run wrote it |
+
+Dispatch/section artifacts always list, available or not — the catalog shows
+what *could* exist, so absence is visible (with a `reason`) rather than
+silent. File artifacts are named by the path the run wrote them to; a review
+file written by a review run and deleted by a later consolidation run is
+still recoverable forever from the spool, since reconstruction never
+consults live disk state — only the Write/Edit tool calls the run made. A
+file is `reconstructable` only when its op sequence starts with a Write; an
+edit-only file (the run `Edit`ed a path it never `Write`-created in this
+run) is listed but honestly marked unavailable — the spool knows the
+patches, not the base content.
+
+**Section-marker convention.** `result.decisions`, `prompt.focus`, and
+`prompt.overrides` are all cut from their source text by one convention: a
+line consisting of just the bare ALL-CAPS marker word (`DECISIONS`, `FOCUS`,
+`OVERRIDES`), optionally prefixed with markdown heading syntax (`#`–`###`)
+and optionally suffixed with `:` — e.g. `DECISIONS`, `## FOCUS`, `OVERRIDES:`
+all match, but the word appearing mid-sentence never does. The section runs
+from the line after the marker to the next such marker line (of any marker,
+not just the same one) or end of text. The **last** occurrence of a marker
+wins, so a run can revise its own DECISIONS later in the same message. This
+is how a foreign (non-agmon) run participates: emit a `DECISIONS` heading in
+your result text and it's picked up the same way.
+
+**Limitations.** File reconstruction covers Write and Edit only — the two
+file-writing tools seen in the real spool; a Notebook-editing tool would need
+its own reconstruction if it ever appears. It answers "what did this run
+write," not "what does the file look like now" or "what did it look like at
+turn N" — there is no cross-run file state or time-travel, and binary
+content is out of scope. The catalog and content endpoints are read-only,
+forever; there is no way to write or edit a spool through this API.
+
 ## Requirements
 
 - Python 3.12+
@@ -104,7 +155,7 @@ agmon ships without authentication by design — it assumes deployment inside a 
 
 The `agmon` client curates the API into default views with escape hatches.
 `serve` and `run` execute **box-side** (they touch the local spool/process);
-the read commands (`ls`/`show`/`tail`/`events`/`costs`) work **from anywhere**
+the read commands (`ls`/`show`/`artifacts`/`tail`/`events`/`costs`) work **from anywhere**
 with `$AGMON_URL` set.
 
 Global behaviour: the server is `--url`, else `$AGMON_URL`, else
@@ -120,6 +171,8 @@ agmon ls                        # fleet glance, newest first (-n N, --all)
 agmon ls --status running       # filter by raw status (also --session <sid>)
 agmon ls --pipeline nightly     # label filter (also --phase Y, --label k=v ×N)
 agmon show a3f9                 # one run, digested (--full-prompt, --raw)
+agmon artifacts a3f9             # catalog: name, kind, available, size
+agmon artifacts --get REVIEW.md  # one artifact's content, raw, to stdout
 agmon tail                      # live-follow the latest run (--last N)
 agmon events a3f9 --errors-only     # forensics table (--type, --after, -n)
 agmon costs --days 7            # cost/turn rollup (--since/--until)
@@ -137,6 +190,15 @@ pipeline lineage — kept visually separate from the resume-chain lines so the t
 relations don't read as one. `agmon run` accepts `--label KEY=VALUE`
 (repeatable) plus the `--pipeline`/`--phase`/`--parent` sugar (see the spool
 contract above for constraints).
+
+`agmon artifacts [id]` lists the [artifact catalog](#the-artifact-catalog) for
+a run; `--get NAME` fetches one artifact's raw content to stdout instead
+(pipeable to a file or `diff`), resolving `NAME` the same way the API does —
+`agmon artifacts --get REVIEW.md` and `agmon artifacts --get
+prompt.overrides` are the two canonical forms. An unknown, ambiguous, or
+unavailable name prints an error to stderr and exits `1`. `agmon show` prints
+a **Decisions** section (same rendering as Result, placed just before it)
+whenever the run's result carries a `DECISIONS` marker.
 
 `agmon tail` is scriptable — it exits `0` on a finished run, `1` on error, and
 `3` if the run died — so `agmon tail $id && next-thing` works. Fields are
@@ -242,6 +304,13 @@ Full run row including `prompt`, the `labels` object, and the parsed `meta_json`
 (everything from the spool `.meta.json`, including fields not columnized), plus
 the same computed fields. 404 with `{"error": "..."}` for an unknown id.
 
+`model` is the model **observed** to have served the run, derived at ingest
+time from the run's `system`/`init` stream event — never the `--model`
+argument the run was dispatched with. A run killed before init stays `null`
+("never observed"); it is never backfilled from requested intent. The
+requested value (if any) is still reachable, unvalidated, as
+`meta_json.model_requested`.
+
 ```sh
 curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
 ```
@@ -249,14 +318,17 @@ curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
 ### `GET /v1/runs/{run_id}/summary`
 
 The full picture for one run: `{run, status, activity, issues, metrics,
-result_text, lineage}`. `status` is the derived status block above; `activity`
-is `{last_tool, last_text, progress}`; `issues` is the most recent 50
-error-flagged tool_results and non-success results (`{seq, category, tool,
+result_text, decisions, lineage}`. `status` is the derived status block above;
+`activity` is `{last_tool, last_text, progress}`; `issues` is the most recent
+50 error-flagged tool_results and non-success results (`{seq, category, tool,
 snippet}`, where `category` is `permission` / `tool_error` / `run_error`);
 `metrics` is `{num_events, tool_counts, duration_seconds, num_turns,
 total_cost_usd, usage}`; `result_text` is the full `result` string from the
-run's result event (null if absent). `run.labels` carries the run's labels.
-All events for the run are loaded per request (no caching).
+run's result event (null if absent); `decisions` is the `DECISIONS` section
+parsed out of `result_text` (null if the run produced no result, or produced
+one with no `DECISIONS` marker) — the same section-marker convention as the
+artifact catalog below. `run.labels` carries the run's labels. All events for
+the run are loaded per request (no caching).
 
 `lineage` is the pipeline-lineage block derived from the reserved labels, or
 `null` when the run carries none of them:
@@ -292,6 +364,35 @@ request's `after` if the page is empty — so a client can poll in a loop.
 curl -s "localhost:8400/v1/runs/20260708T174951-67a5e8/events?after=0&errors_only=true"
 ```
 
+### `GET /v1/runs/{run_id}/artifacts`
+
+The artifact catalog (see [above](#the-artifact-catalog)): `{"artifacts": [...]}`,
+both families in one list. Each item carries `name`, `kind`
+(`"dispatch"` | `"section"` | `"file"`), and `available`; when available,
+`bytes` (UTF-8 byte length); when not, a `reason`. File items additionally
+carry `path`, `ops`, `first_op` (`"write"` | `"edit"`), `last_seq`, and
+`reconstructable`. Dispatch/section artifacts always list, available or not.
+404 for an unknown run id.
+
+```sh
+curl -s localhost:8400/v1/runs/20260708T174951-67a5e8/artifacts
+```
+
+### `GET /v1/runs/{run_id}/artifacts/content?name=<name>`
+
+The content of one artifact, as `text/plain; charset=utf-8`. `name`
+resolution, in order: exact dispatch-artifact name (`prompt`,
+`result.decisions`, ...); exact file path; unique file basename or substring
+(`name=REVIEW.md` finds a review file without knowing its worktree path). 404
+`{"error": "..."}` for a name matching nothing; 409 `{"error": "...", "reason":
+"..."}` for a listed-but-unavailable artifact (absent marker, or a
+non-reconstructable edit-only file); 400 `{"error": "...", "candidates":
+[...]}` for a fragment matching more than one file.
+
+```sh
+curl -s "localhost:8400/v1/runs/20260708T174951-67a5e8/artifacts/content?name=REVIEW.md"
+```
+
 ### `GET /v1/stats/costs?since=<iso>&until=<iso>&bucket=day`
 
 Cost/turn rollup over the runs table, bucketed by `started_at` date in UTC
@@ -317,11 +418,12 @@ src/agmon/
   db.py        # schema + connection helpers, drop-and-replay migration
   labels.py    # label constraints — the spool primitive (strict wrapper, lenient ingest)
   ingest.py    # background scanner (the only writer)
-  derive.py    # pure derivation functions (status/activity/issues/metrics/result/lineage)
+  derive.py    # pure derivation functions (status/activity/issues/metrics/result/lineage/sections)
+  artifacts.py # pure artifact catalog: file reconstruction + name resolution
   api.py       # FastAPI app + endpoints
   client.py    # pure HTTP client + id resolution + lineage (no printing)
   render.py    # all CLI formatting (tables/TSV/event compaction; no I/O)
-  cli.py       # argument parsing + wiring (agmon ls/show/tail/events/costs/serve/run)
+  cli.py       # argument parsing + wiring (agmon ls/show/artifacts/tail/events/costs/serve/run)
   runner.py    # `agmon run` — the ported launch/spool wrapper
   __main__.py  # `python -m agmon` (the CLI)
 emacs/
@@ -337,4 +439,5 @@ tests/
   test_client.py       # id resolution + lineage
   test_render.py       # event compaction + field flattening
   test_cli.py          # output layering + tail loop + run smoke
+  test_artifacts.py    # sections, file reconstruction, catalog, API, CLI, model harvest
 ```
