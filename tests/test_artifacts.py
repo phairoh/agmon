@@ -680,3 +680,108 @@ def test_show_omits_decisions_when_absent():
     stub = DecisionsShowStub(summary)
     _, out, _ = _run_cli(["show", "a3f9c1"], stub, tty=False)
     assert "picked approach" not in out
+
+
+# ============================================================================
+# 5. Model harvest — runs.model derived from the init event, observed only
+# ============================================================================
+
+import sqlite3  # noqa: E402
+
+from agmon import db, runner  # noqa: E402
+from agmon.ingest import Ingester  # noqa: E402
+
+
+def test_model_populated_from_init_event(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-model01"
+    write_meta(runs_dir, run_id, status="finished", started_at="2026-07-09T00:00:00+00:00")
+    (runs_dir / f"{run_id}.jsonl").write_text(
+        jsonl_lines(
+            {"type": "system", "subtype": "init", "model": "claude-opus-4-8[1m]"},
+            {"type": "result", "subtype": "success"},
+        )
+    )
+    ingester.scan()
+    resp = client.get(f"/v1/runs/{run_id}")
+    assert resp.json()["model"] == "claude-opus-4-8[1m]"
+
+
+def test_model_null_when_no_init_event(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-model02"
+    write_meta(runs_dir, run_id, status="error", started_at="2026-07-09T00:00:00+00:00")
+    (runs_dir / f"{run_id}.jsonl").write_text(
+        jsonl_lines({"type": "assistant", "message": {}})
+    )
+    ingester.scan()
+    resp = client.get(f"/v1/runs/{run_id}")
+    assert resp.json()["model"] is None
+
+
+def test_model_requested_never_used_as_fallback(env):
+    runs_dir, client, ingester = env
+    run_id = "20260709T000000-model03"
+    write_meta(runs_dir, run_id, status="running", model_requested="claude-haiku-4-5",
+               started_at="2026-07-09T00:00:00+00:00")
+    (runs_dir / f"{run_id}.jsonl").write_text(
+        jsonl_lines({"type": "system", "subtype": "init"})  # no model field on init
+    )
+    ingester.scan()
+    resp = client.get(f"/v1/runs/{run_id}")
+    assert resp.json()["model"] is None
+    assert resp.json()["meta_json"]["model_requested"] == "claude-haiku-4-5"
+
+
+def test_model_backfills_on_replay(tmp_path):
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    config = Config(
+        runs_dir=runs_dir, db_path=tmp_path / "agmon.db",
+        host="127.0.0.1", port=8400, stall_seconds=300,
+    )
+    # A historical-style meta.json: legacy "model" field the old wrapper wrote,
+    # no model_requested — must not leak into the backfilled column.
+    write_meta(runs_dir, "old1", status="finished", model="legacy-value",
+               started_at="2026-07-08T00:00:00+00:00")
+    (runs_dir / "old1.jsonl").write_text(
+        jsonl_lines(
+            {"type": "system", "subtype": "init", "model": "claude-opus-4-8[1m]"},
+            {"type": "result", "subtype": "success"},
+        )
+    )
+
+    db.init_db(config.db_path)
+    ing = Ingester(config)
+    ing.scan()
+    row = ing.conn.execute("SELECT model FROM runs WHERE run_id=?", ("old1",)).fetchone()
+    assert row["model"] == "claude-opus-4-8[1m]"  # not "legacy-value"
+    ing.conn.close()
+
+    # Simulate an older-schema db and force drop-and-replay.
+    conn = sqlite3.connect(config.db_path)
+    conn.execute("UPDATE schema_meta SET version = 1")
+    conn.commit()
+    conn.close()
+    db.init_db(config.db_path)
+    ing2 = Ingester(config)
+    assert ing2.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    ing2.scan()
+    row2 = ing2.conn.execute("SELECT model FROM runs WHERE run_id=?", ("old1",)).fetchone()
+    assert row2["model"] == "claude-opus-4-8[1m]"
+    ing2.conn.close()
+
+
+def test_wrapper_writes_model_requested_not_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "RUNS_DIR", tmp_path)
+
+    def _boom(*a, **k):
+        raise FileNotFoundError  # short-circuit before launching claude
+
+    monkeypatch.setattr(runner.subprocess, "Popen", _boom)
+    with pytest.raises(SystemExit):
+        runner.main(["hello", "--cwd", str(tmp_path), "--model", "claude-haiku-4-5"])
+
+    meta = json.loads(next(tmp_path.glob("*.meta.json")).read_text())
+    assert meta["model_requested"] == "claude-haiku-4-5"
+    assert "model" not in meta

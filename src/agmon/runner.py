@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> None:
         "argv": cmd[:1] + ["<prompt omitted>"] + cmd[3:],  # avoid duplicating long prompts
         "cwd": str(cwd),
         "git": git_info(cwd),
-        "model": args.model,
+        "model_requested": args.model,  # the --model argument; observed model lives in runs.model
         "permission_mode": args.permission_mode,
         "host": os.uname().nodename,
         "session_id": None,
