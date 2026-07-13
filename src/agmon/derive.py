@@ -236,6 +236,41 @@ def derive_issues(events: list[dict]) -> list[dict]:
     return issues[-50:]
 
 
+# -- section extraction -------------------------------------------------------
+
+# Any line that is a bare ALL-CAPS "word" (letters/digits/underscore), optionally
+# prefixed by a markdown heading (#-###) and optionally suffixed with ':' —
+# anchored at line start/end so the word mid-prose never matches.
+_ANY_MARKER_LINE_RE = re.compile(r"^(?:#{1,3}\s*)?[A-Z][A-Z0-9_]*:?[ \t]*$", re.MULTILINE)
+
+
+def derive_section(text: str | None, marker: str) -> str | None:
+    """The text of the last MARKER section in ``text``: from the line right
+    after the last line-anchored occurrence of ``marker`` (optionally
+    heading-prefixed / colon-suffixed) to the next such marker line (any
+    marker, not just this one) or end of text. The heading line itself is
+    excluded. ``None`` when ``text`` is ``None`` or the marker is absent —
+    this is the one parser behind ``result.decisions``, ``prompt.focus``, and
+    ``prompt.overrides``."""
+    if text is None:
+        return None
+    this_marker_re = re.compile(
+        rf"^(?:#{{1,3}}\s*)?{re.escape(marker)}:?[ \t]*$", re.MULTILINE
+    )
+    matches = list(this_marker_re.finditer(text))
+    if not matches:
+        return None
+    start = matches[-1].end()
+    if start < len(text) and text[start] == "\n":
+        start += 1
+    next_marker = _ANY_MARKER_LINE_RE.search(text, start)
+    end = next_marker.start() if next_marker else len(text)
+    section = text[start:end]
+    if section.endswith("\n"):
+        section = section[:-1]
+    return section
+
+
 # -- result text -------------------------------------------------------------
 
 

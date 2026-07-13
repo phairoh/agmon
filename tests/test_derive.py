@@ -215,3 +215,61 @@ def test_metrics_duration_to_now_when_running():
     m = derive.derive_metrics(run, [], NOW)
     assert m["duration_seconds"] == 3600
     assert m["usage"] is None
+
+
+# -- section extraction (derive_section) --------------------------------------
+
+
+def test_section_bare_marker_no_heading_no_colon():
+    text = "intro text\nDECISIONS\nfirst point\nsecond point\n"
+    assert derive.derive_section(text, "DECISIONS") == "first point\nsecond point"
+
+
+def test_section_heading_prefix_variants():
+    for prefix in ("#", "##", "###"):
+        text = f"intro\n{prefix} DECISIONS\nbody here\n"
+        assert derive.derive_section(text, "DECISIONS") == "body here"
+
+
+def test_section_trailing_colon():
+    text = "intro\nDECISIONS:\nbody here\n"
+    assert derive.derive_section(text, "DECISIONS") == "body here"
+
+
+def test_section_heading_and_colon_combined():
+    text = "intro\n## DECISIONS:\nbody here\n"
+    assert derive.derive_section(text, "DECISIONS") == "body here"
+
+
+def test_section_last_occurrence_wins():
+    text = "DECISIONS\nfirst attempt\nDECISIONS\nfinal answer\n"
+    assert derive.derive_section(text, "DECISIONS") == "final answer"
+
+
+def test_section_runs_to_next_marker():
+    text = "FOCUS\nlook at X\nOVERRIDES\nskip Y\n"
+    assert derive.derive_section(text, "FOCUS") == "look at X"
+    assert derive.derive_section(text, "OVERRIDES") == "skip Y"
+
+
+def test_section_runs_to_eof_when_no_next_marker():
+    text = "intro\nDECISIONS\nline one\nline two"
+    assert derive.derive_section(text, "DECISIONS") == "line one\nline two"
+
+
+def test_section_marker_mid_prose_does_not_trigger():
+    text = "This paragraph discusses DECISIONS made previously in detail.\nmore text\n"
+    assert derive.derive_section(text, "DECISIONS") is None
+
+
+def test_section_absent_marker_returns_none():
+    assert derive.derive_section("no markers here at all\n", "DECISIONS") is None
+
+
+def test_section_null_text_returns_none():
+    assert derive.derive_section(None, "DECISIONS") is None
+
+
+def test_section_empty_between_marker_and_next():
+    text = "DECISIONS\nFOCUS\nbody\n"
+    assert derive.derive_section(text, "DECISIONS") == ""
