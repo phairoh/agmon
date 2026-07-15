@@ -1,3 +1,5 @@
+> Status: 2026-07-13 — superseded by 007 for model harvest; artifact catalog
+> unimplemented, shelved.
 # Task: agmon stage 4b — artifact surfacing
 
 Runs produce durable artifacts that git deliberately forgets: REVIEW.md
