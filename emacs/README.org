@@ -96,7 +96,7 @@ One row per run; auto-refreshes while a window shows it.
 | =RET= | open the run at point (detail view)                |
 | =t=   | tail the run at point (live event stream)          |
 | =J=   | raw =/summary= JSON for the run at point           |
-| =$=   | fleet cost rollup                                  |
+| =c=   | fleet cost rollup                                  |
 | =o=   | restore the default newest-first sort              |
 | =g=   | refresh now                                        |
 | =q=   | bury the buffer                                    |

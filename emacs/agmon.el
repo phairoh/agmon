@@ -967,7 +967,7 @@ against a canned payload."
 
 Each row is one run; the list auto-refreshes while a window shows it.
 RET opens the run at point, t tails it live, J shows its raw JSON, and
-$ opens the fleet cost rollup.  g refreshes now, q buries the buffer,
+c opens the fleet cost rollup.  g refreshes now, q buries the buffer,
 and ? shows this help.
 
 \\{agmon-list-mode-map}"
@@ -1009,8 +1009,8 @@ and ? shows this help.
 ;; `t' opens a live event tail for the run at point.
 (keymap-set agmon-list-mode-map "t" #'agmon-tail)
 
-;; `$' opens the fleet-wide cost rollup (a separate screen, not per-run).
-(keymap-set agmon-list-mode-map "$" #'agmon-costs)
+;; `c' opens the fleet-wide cost rollup (a separate screen, not per-run).
+(keymap-set agmon-list-mode-map "c" #'agmon-costs)
 
 ;; `?' shows the mode help (the standard `C-h m' view); handy in a
 ;; read-only buffer where `?' is otherwise unused.
