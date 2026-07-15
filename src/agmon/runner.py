@@ -165,7 +165,6 @@ def main(argv: list[str] | None = None) -> None:
         "argv": cmd[:1] + ["<prompt omitted>"] + cmd[3:],  # avoid duplicating long prompts
         "cwd": str(cwd),
         "git": git_info(cwd),
-        "model": args.model,
         "permission_mode": args.permission_mode,
         "host": os.uname().nodename,
         "session_id": None,
@@ -179,6 +178,11 @@ def main(argv: list[str] | None = None) -> None:
         "total_cost_usd": None,
         "labels": labels,          # flat key=value facts; meaning lives in derivation
     }
+    # Requested intent (the --model *argument*, rarely passed) is recorded here
+    # for the run-detail meta passthrough, omitted when absent. It is NEVER the
+    # observed model: the ingester derives that from the init event, not meta.
+    if args.model:
+        meta["model_requested"] = args.model
 
     try:
         with open(jsonl_path, "w") as spool, open(stderr_path, "w") as errlog:

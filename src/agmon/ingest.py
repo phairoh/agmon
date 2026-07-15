@@ -21,12 +21,14 @@ log = logging.getLogger("agmon.ingest")
 
 # Meta fields that get their own column. `git` is nested and handled separately;
 # everything (including unlisted fields) is also kept verbatim in meta_json.
+# `model` is NOT here: it is the *observed* model, derived from the run's init
+# event in `_ingest_events`, never the requested `--model` argument the meta
+# carries. A run killed before init honestly stays null (never observed).
 _META_COLUMNS = (
     "run_id",
     "session_id",
     "prompt",
     "cwd",
-    "model",
     "host",
     "pid",
     "started_at",
@@ -235,6 +237,7 @@ class Ingester:
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE run_id=?", (run_id,)
         ).fetchone()[0]
         rows = []
+        observed_model: str | None = None
         for raw in chunk.split(b"\n"):
             if not raw.strip():
                 continue
@@ -248,6 +251,10 @@ class Ingester:
             if isinstance(obj, dict):
                 typ = _as_str_or_none(obj.get("type"))
                 sub = _as_str_or_none(obj.get("subtype"))
+                # The init system event carries the resolved model identity.
+                # Capture the first one; this is the observed model.
+                if observed_model is None and typ == "system" and sub == "init":
+                    observed_model = _as_str_or_none(obj.get("model"))
             else:
                 typ, sub = None, None
             rows.append((run_id, seq, typ, sub, text, int(_is_error_event(obj))))
@@ -257,6 +264,13 @@ class Ingester:
             self.conn.execute(
                 "INSERT OR IGNORE INTO runs (run_id) VALUES (?)", (run_id,)
             )
+            # Observed model, once seen, is set on the run. Only overwrite with a
+            # real value — never clobber a prior observation back to null.
+            if observed_model is not None:
+                self.conn.execute(
+                    "UPDATE runs SET model=? WHERE run_id=?",
+                    (observed_model, run_id),
+                )
             if rows:
                 self.conn.executemany(
                     "INSERT OR IGNORE INTO events "

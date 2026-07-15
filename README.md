@@ -50,6 +50,21 @@ The wrapper enforces these strictly (a bad `--label` never launches). The
 ingester is lenient: a foreign or buggy meta.json with a malformed entry has
 that entry skipped with a log line — it never fails the file.
 
+### Observed vs. requested model
+
+`runs.model` is the **observed** model: the resolved model identity the stream
+reports in its init system event, derived at ingest time. A run killed before
+init honestly stays null — "never observed" is signal, not a gap. The requested
+`--model` *argument* (rarely passed, and only an intent) is never used as a
+fallback: intent is not observation.
+
+The argument, when passed, is recorded separately in `<run_id>.meta.json` as a
+top-level `"model_requested"` field (omitted when no `--model` was given). It
+has no column of its own — it stays retrievable through the run detail's
+`meta_json` passthrough. Because the model is derived at ingest, a schema bump
++ replay backfills it across all history: every historical run learns which
+model actually served it.
+
 Three keys are **reserved by convention** (still stored as ordinary labels):
 `pipeline` (a grouping id), `phase` (conventionally `spec`/`build`/`review`/
 `consolidate`, but any value renders — no vocabulary or ordering is enforced),
