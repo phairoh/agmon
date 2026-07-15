@@ -753,9 +753,14 @@ itself wears the `link' face as an affordance."
                   'help-echo "mouse-1/RET: open this run"
                   'keymap agmon--lineage-map))))
 
-(defun agmon--indent-field (label value)
-  "An indented LABEL/VALUE row for a sub-section heading (Pipeline, Labels)."
-  (concat "  " (propertize (format "%-9s" label) 'face 'agmon-detail-label) value))
+(defun agmon--indent-field (label value &optional width)
+  "An indented LABEL/VALUE row for a sub-section heading (Pipeline, Labels).
+LABEL is right-padded to WIDTH columns (default 9) so sibling rows align;
+pass a wider WIDTH when a block has long keys (e.g. \"experiment\") that
+would otherwise crowd the value."
+  (concat "  "
+          (propertize (string-pad label (or width 9)) 'face 'agmon-detail-label)
+          value))
 
 (defun agmon--pipeline-value-line (pipeline)
   "Render the clickable pipeline-id row; RET/click lists that pipeline.
@@ -817,21 +822,22 @@ against a canned payload."
                               (format "   ·   %s ago" (agmon--format-age started-age))
                               'face 'shadow)
                            ""))))
+           ;; Duration carries the run's extent -- elapsed time plus the
+           ;; turn/event counts and exit code.  Turns and events measure how
+           ;; much ran, not what it cost, so they live here, not on Cost;
+           ;; keeping them off Cost also stops a still-running run (no cost
+           ;; yet) from showing a lone "N events" under a Cost label.
            (dur-str (string-join
                      (delq nil
                            (list (and dur (agmon--format-age dur))
+                                 (and .run.num_turns
+                                      (format "%d turns" .run.num_turns))
+                                 (and .run.event_count
+                                      (format "%d events" .run.event_count))
                                  (and (numberp .run.exit_code)
                                       (format "exit %d" .run.exit_code))))
                      "   ·   "))
-           (cost-str (string-join
-                      (delq nil
-                            (list (agmon--nonempty
-                                   (agmon--format-cost .run.total_cost_usd))
-                                  (and .run.num_turns
-                                       (format "%d turns" .run.num_turns))
-                                  (and .run.event_count
-                                       (format "%d events" .run.event_count))))
-                      "   ·   "))
+           (cost-str (agmon--nonempty (agmon--format-cost .run.total_cost_usd)))
            (tools (agmon--format-tool-counts .metrics.tool_counts))
            (lines nil))
       ;; Header: a status-coloured dot, the short id, and the status word.
@@ -848,6 +854,7 @@ against a canned payload."
                                  (agmon--detail-field "Path" .run.cwd)
                                  (agmon--detail-field "Git" git)
                                  (agmon--detail-field "Host" .run.host)
+                                 (agmon--detail-field "Model" .run.model)
                                  (agmon--detail-field "Started" started-str)
                                  (agmon--detail-field "Duration" dur-str)
                                  (agmon--detail-field "Cost" cost-str)
@@ -907,10 +914,17 @@ against a canned payload."
         (when other
           (push "" lines)
           (push (propertize "Labels" 'face 'agmon-detail-heading) lines)
-          (dolist (kv other)
-            (push (agmon--indent-field (format "%s" (car kv))
-                                       (format "%s" (cdr kv)))
-                  lines))))
+          ;; Align the block to its widest key (min 9, +2 gutter) so a long
+          ;; key like "experiment" does not crowd its value.
+          (let ((w (max 9 (+ 2 (apply #'max 0
+                                      (mapcar (lambda (kv)
+                                                (length (format "%s" (car kv))))
+                                              other))))))
+            (dolist (kv other)
+              (push (agmon--indent-field (format "%s" (car kv))
+                                         (format "%s" (cdr kv))
+                                         w)
+                    lines)))))
       ;; Issues, collapsed to the heading unless SHOW-ISSUES (they are
       ;; usually the routine \"read before edit\" kind, so hide by default).
       (when .issues

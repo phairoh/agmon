@@ -203,6 +203,45 @@ phase=build,pipeline=artifacts-006")))
       (should (equal (car entry) "20260710T012416-efb89a"))
       (should (= (length (cadr entry)) 3)))))
 
+;;;; Detail view
+
+(ert-deftest agmon-test-indent-field-aligns ()
+  "`agmon--indent-field' pads the label to WIDTH so long keys are not squished."
+  ;; Default width 9: a short key gets its trailing pad.
+  (should (equal (substring-no-properties (agmon--indent-field "phase" "build"))
+                 "  phase    build"))
+  ;; A wider WIDTH keeps a long key from crowding its value.
+  (should (equal (substring-no-properties
+                  (agmon--indent-field "experiment" "ab" 12))
+                 "  experiment  ab")))
+
+(ert-deftest agmon-test-render-summary-fields ()
+  "Model shows as its own field; turns/events sit with Duration, not Cost."
+  (let* ((summary '((status . ((effective_status . "finished")))
+                    (run . ((run_id . "20260713T172231-2c9e67")
+                            (cwd . "/home/aaron/src/agmon")
+                            (model . "opus")
+                            (started_at . "2026-07-13T17:22:31Z")
+                            (total_cost_usd . 6.14)
+                            (num_turns . 67)
+                            (event_count . 408)
+                            (exit_code . 0)))
+                    (metrics . ((duration_seconds . 856)))))
+         (lines (split-string
+                 (substring-no-properties
+                  (agmon--render-summary summary (current-time) nil nil))
+                 "\n"))
+         (row (lambda (prefix)
+                (seq-find (lambda (l) (string-prefix-p prefix l)) lines))))
+    ;; Model surfaces as its own labelled row.
+    (should (string-match-p "opus" (funcall row "Model")))
+    ;; Turns and events ride the Duration row (they measure extent, not cost).
+    (should (string-match-p "67 turns" (funcall row "Duration")))
+    (should (string-match-p "408 events" (funcall row "Duration")))
+    ;; Cost shows the dollar amount and neither turns nor events.
+    (should (string-match-p "\\$6.14" (funcall row "Cost")))
+    (should-not (string-match-p "turns\\|events" (funcall row "Cost")))))
+
 ;;;; Session lineage split
 
 (defconst agmon-test--session-runs
