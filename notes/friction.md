@@ -64,3 +64,24 @@
   derivation from events; fits the represent half. Natural extension:
   human-reviewed chains, where each phase's surfaced artifact gets a
   person's sign-off recorded on the lineage.
+- ENHANCE (agmon.el): copy a tabulated-list screen as TSV. The column
+  header is a `header-line`, not buffer text, so it can't be marked or
+  killed — you can copy the data rows but never the titles, which makes
+  pasting the table into a doc/spreadsheet lossy. Add a buffer command
+  (mnemonic `w`, "copy") that yanks the header plus the visible rows,
+  tab-separated, to the kill-ring. Pure formatting over
+  `tabulated-list-format` (the column names) and the printed rows, so it
+  is ERT-testable; applies to every such screen (run list, cost rollup).
+  Surfaced 2026-07-13 while adding the new run-list columns.
+- ENHANCE (cli): no headerless output for scripting a single field.
+  `agmon show --fields run.run_id --plain` still prints the header line
+  ("run.run_id" then the value), so you can't do
+  `ID=$(agmon show <run> --fields run.run_id --plain)` without stripping
+  it. Cause: `render.to_tsv` unconditionally prepends the header row
+  (render.py:225) and every `--plain`/piped path goes through it
+  (`_emit_rows`, cli.py:66; `cmd_show`, cli.py:134). Options: a
+  `--no-header` flag, or suppress the header when `--fields` projects a
+  single column, or drop it whenever `--plain` is explicit (TSV-with-
+  header still the default for spreadsheet paste). Today's workaround is
+  `--json` piped to jq, but a bare value is the natural ask. Surfaced
+  2026-07-13.
