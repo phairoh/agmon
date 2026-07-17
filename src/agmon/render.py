@@ -176,6 +176,11 @@ def summarize_event(event: dict) -> Styled:
         texts = _text_blocks(event)
         if texts:
             return Styled(_oneline(texts[-1]) or "assistant", "dim")
+        # Thinking bodies are only present when the run was dispatched with
+        # --thinking-display summarized; older spools carry empty strings.
+        for b in _blocks(event):
+            if b.get("type") == "thinking" and (b.get("thinking") or "").strip():
+                return Styled(f"thinking: {_oneline(b['thinking'])}", "dim italic")
         return Styled("assistant", "dim")
 
     if etype == "user":

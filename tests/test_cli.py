@@ -221,3 +221,38 @@ def test_run_parser_smoke():
 def test_run_parser_requires_prompt():
     with pytest.raises(SystemExit):
         runner.build_parser().parse_args([])
+
+
+def _dispatch_argv(tmp_path, monkeypatch, run_args):
+    """Run the wrapper with Popen short-circuited; return the meta argv."""
+    import json
+
+    monkeypatch.setattr(runner, "RUNS_DIR", tmp_path)
+
+    def _boom(*a, **k):
+        raise FileNotFoundError  # short-circuit before launching claude
+
+    monkeypatch.setattr(runner.subprocess, "Popen", _boom)
+    with pytest.raises(SystemExit):
+        runner.main(run_args + ["--cwd", str(tmp_path)])
+    return json.loads(next(tmp_path.glob("*.meta.json")).read_text())["argv"]
+
+
+def test_run_experimental_thinking_default_off():
+    args = runner.build_parser().parse_args(["hi"])
+    assert args.agmon_experimental_display_thinking is False
+
+
+def test_run_experimental_thinking_sets_both_claude_flags(tmp_path, monkeypatch):
+    argv = _dispatch_argv(
+        tmp_path, monkeypatch, ["hello", "--agmon-experimental-display-thinking"]
+    )
+    # One agmon flag fans out to the undocumented claude pair.
+    assert argv[argv.index("--thinking") + 1] == "adaptive"
+    assert argv[argv.index("--thinking-display") + 1] == "summarized"
+
+
+def test_run_without_experimental_thinking_passes_nothing(tmp_path, monkeypatch):
+    argv = _dispatch_argv(tmp_path, monkeypatch, ["hello"])
+    assert "--thinking" not in argv
+    assert "--thinking-display" not in argv

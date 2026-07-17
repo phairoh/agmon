@@ -200,3 +200,53 @@ def test_to_tsv_is_plain_tab_joined():
     assert cells[1] == "running"  # style stripped in TSV
     # no rich box-drawing / decoration
     assert "│" not in tsv and "┃" not in tsv
+
+
+# -- thinking compaction (spec: summarized thinking display) ------------------
+
+
+def test_summarize_thinking_block_shows_snippet():
+    event = {
+        "seq": 2,
+        "type": "assistant",
+        "payload": {
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "thinking",
+                 "thinking": "I'm working through the well puzzle.\nNet gain per cycle is 1m."}
+            ]},
+        },
+    }
+    s = render.summarize_event(event)
+    assert s.text == "thinking: I'm working through the well puzzle. Net gain per cycle is 1m."
+    assert s.style == "dim italic"
+
+
+def test_summarize_empty_thinking_stays_bare_assistant():
+    # Spools recorded before --thinking-display summarized: bodies are empty.
+    event = {
+        "seq": 2,
+        "type": "assistant",
+        "payload": {
+            "type": "assistant",
+            "message": {"content": [{"type": "thinking", "thinking": ""}]},
+        },
+    }
+    s = render.summarize_event(event)
+    assert s.text == "assistant"
+
+
+def test_summarize_text_beats_thinking():
+    event = {
+        "seq": 3,
+        "type": "assistant",
+        "payload": {
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "thinking", "thinking": "hidden reasoning"},
+                {"type": "text", "text": "the answer"},
+            ]},
+        },
+    }
+    s = render.summarize_event(event)
+    assert s.text == "the answer"

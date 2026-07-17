@@ -154,6 +154,16 @@ relations don't read as one. `agmon run` accepts `--label KEY=VALUE`
 (repeatable) plus the `--pipeline`/`--phase`/`--parent` sugar (see the spool
 contract above for constraints).
 
+`agmon run --agmon-experimental-display-thinking` dispatches with claude's
+**undocumented** `--thinking adaptive --thinking-display summarized` pair, so
+the spooled stream carries readable thinking summaries instead of the empty
+bodies headless claude emits by default — `agmon tail` and `agmon events`
+render them as dim `thinking:` lines whenever an assistant event has no text
+or tool call to show. Deliberately a single opt-in agmon flag rather than
+pass-throughs: the underlying options are not part of claude's documented CLI
+surface (verified against 2.1.212) and may change or vanish in any release —
+a claude that doesn't know them fails the dispatch outright.
+
 `agmon tail` is scriptable — it exits `0` on a finished run, `1` on error, and
 `3` if the run died — so `agmon tail $id && next-thing` works. Fields are
 discoverable from the tool itself:

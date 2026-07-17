@@ -74,6 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cwd", default=".", help="working directory for the run")
     ap.add_argument("--model", default=None)
     ap.add_argument(
+        "--agmon-experimental-display-thinking",
+        action="store_true",
+        help="dispatch with claude's undocumented `--thinking adaptive "
+        "--thinking-display summarized` so the spool carries readable thinking "
+        "summaries; experimental — the flags may change in any claude release",
+    )
+    ap.add_argument(
         "--permission-mode",
         default=None,
         help="e.g. acceptEdits, bypassPermissions, plan",
@@ -138,6 +145,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd.append("--bare")
     if args.model:
         cmd += ["--model", args.model]
+    if args.agmon_experimental_display_thinking:
+        # Undocumented claude flags (verified against 2.1.212): a claude that
+        # doesn't know them fails the dispatch outright, hence opt-in.
+        cmd += ["--thinking", "adaptive", "--thinking-display", "summarized"]
     if args.permission_mode:
         cmd += ["--permission-mode", args.permission_mode]
     if args.allowed_tools:
