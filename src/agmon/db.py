@@ -12,7 +12,7 @@ from pathlib import Path
 # Bump this whenever the schema changes. Migrations are drop-and-replay: on a
 # version mismatch the db file is deleted and the whole spool re-ingested (the
 # spool is the source of truth, the db a disposable index). See init_db.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4  # 4: runs.model derived from the init event, not meta
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
