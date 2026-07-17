@@ -59,6 +59,22 @@ and `parent` (a run_id, the causal edge). Derivation reads these to build the
 `pipeline`). This pipeline lineage is distinct from resume-chain lineage
 (shared `session_id`); the two are never conflated.
 
+### Observed vs requested model
+
+A run's `model` is **observed**: derived at ingest from the run's init system
+event, byte-exact as the stream reported it (variant suffix included, e.g.
+`claude-opus-4-8[1m]`). A run killed before its init event honestly stays
+null — "never observed" is signal, not a gap. The requested value is never
+used as a fallback; intent is not observation.
+
+The `--model` argument is the requested intent: `agmon run` records it in
+`<run_id>.meta.json` as `model_requested` (an additive spool-contract field,
+written only when the flag is passed). It gets no column of its own; it stays
+retrievable via the run detail's `meta_json` passthrough. Older spool files
+carry a meta `model` key instead — that key is dead: the ingester no longer
+reads it, so after a replay each historical run's `model` comes from its init
+event or stays null.
+
 ## Requirements
 
 - Python 3.12+
@@ -239,8 +255,9 @@ curl -s "localhost:8400/v1/runs?label=pipeline=nightly&label=phase=build"
 ### `GET /v1/runs/{run_id}`
 
 Full run row including `prompt`, the `labels` object, and the parsed `meta_json`
-(everything from the spool `.meta.json`, including fields not columnized), plus
-the same computed fields. 404 with `{"error": "..."}` for an unknown id.
+(everything from the spool `.meta.json`, including fields not columnized — e.g.
+`model_requested`), plus the same computed fields. 404 with `{"error": "..."}`
+for an unknown id.
 
 ```sh
 curl -s localhost:8400/v1/runs/20260708T174951-67a5e8
