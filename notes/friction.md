@@ -1,22 +1,44 @@
 # friction
-- INVESTIGATE: thinking blocks in spool are present but empty.
-  `jq '.message.content[]? | select(.type=="thinking")'` on recent runs
-  yields blocks with empty `.thinking` fields (40/40 sampled, 2026-07-11).
-  Questions: does `claude -p` stream-json thin thinking bodies on stdout?
-  Is content under a different key (delta events / signature fields)?
-  Does MAX_THINKING_TOKENS or --include-partial-messages change what's
-  spooled? Check docs + a probe run before designing any rendering.
-  If capturable: tail snippet + --thinking flag, events --type thinking,
-  summary.activity.last_thinking (the stalled-vs-thinking sensor).
-  WHY THIS RANKS HIGH (not just a nice-to-have): thinking is where an
-  agent's confusion is legible. Without it the operator sees the tool
-  calls and the result but not *what tripped the agent up* — the dead
-  keybinding it couldn't explain, the checkdoc warning it burned three
-  round-trips on, the wrong assumption it never stated. Those are exactly
-  the moments you want to catch, and they are invisible in the current
-  stream. Surfacing thinking turns agmon from "what did it do" into "why
-  did it get stuck", which is the whole point of monitoring a headless run
-  you can't watch live.
+- Multi-agent future: `agmon run` hardcodes `["claude", "-p", ...]`
+  (runner.py) and resolves it via ambient PATH — which is exactly what
+  broke on the box (fnm multishell dirs; see next entry). Enhancement:
+  an agent registry in config (name -> absolute binary path + argv
+  template), `agmon run --agent <name>`, agent stamped into meta. Kills
+  the PATH-sensitivity class and is the natural seam for a second agent
+  CLI. Caveat that makes this a spec, not a tweak: ingest/derive assume
+  Claude stream-json event shape (result subtypes, tool_result error
+  flags, session ids) — a second agent needs an output adapter or an
+  agent-aware spool contract. The registry's argv templates are also the
+  container on-ramp: a dockerized agent (official image exists:
+  ghcr.io/anthropics/claude-code) is just an entry whose template is
+  `docker run --rm -v {cwd}:/work ... image:tag -p {prompt}` — right
+  boundary for unattended bypassPermissions pipeline runs, agmon stays
+  docker-unaware. Costs to spec: per-project toolchain images, creds
+  (API key, not mounted OAuth), uid mapping, pid-of-client semantics
+  for `died` detection. (2026-07-16, operator musing after the PATH
+  incident.)
+- `agmon run` reports any Popen FileNotFoundError as "claude not found on
+  PATH" (runner.py). Misleading in two real cases: (a) `claude` exists only
+  as a shell alias/function (local-install alias in ~/.bashrc) — invisible
+  to an argv-list Popen; (b) `claude` IS on PATH but is a dangling symlink
+  or a script with a dead shebang interpreter — exec fails ENOENT and the
+  message blames PATH. Enhancement: preflight with shutil.which and print
+  the PATH searched; if which() finds it yet exec fails, say the target is
+  broken instead. Hit 2026-07-16 diagnosing "works in my shell, fails via
+  agmon run" on the box.
+- ENHANCE: `summary.activity.last_thinking` — the stalled-vs-thinking
+  sensor. Now that spools can carry thinking bodies (2026-07-17: the
+  empty thinking blocks were claude's `display: omitted` default in
+  headless mode; `agmon run --agmon-experimental-display-thinking` opts a
+  dispatch into the undocumented claude flag pair, and tail/events render
+  `thinking:` snippets — see README), the derive layer could surface the
+  latest thinking text on
+  the summary's `activity` block, distinguishing "quietly reasoning" from
+  "stalled" during long silent stretches. Pure read-time derivation over
+  events, no schema bump. Residual of the resolved empty-thinking
+  INVESTIGATE entry (2026-07-11), which held the rationale: thinking is
+  where an agent's confusion is legible — it turns agmon from "what did
+  it do" into "why did it get stuck".
 - `/v1/runs` items carry no progress field; the latest PROGRESS line lives
   only in `/v1/runs/{id}/summary` (`activity.progress`). A list client that
   wants a live progress column must fetch /summary per run — n+1, and it
@@ -85,3 +107,40 @@
   header still the default for spreadsheet paste). Today's workaround is
   `--json` piped to jq, but a bare value is the natural ask. Surfaced
   2026-07-13.
+- ENHANCE (cli): `agmon show` needs a pager, and there is no way to keep
+  colour through a pipe. Piped stdout → `_resolve_tty` false → the rich
+  Console is built `force_terminal=False, no_color=True` (cli.py:370), so
+  `| less -R` gets zero ANSI to preserve; rich's FORCE_COLOR env is also
+  dead because `force_terminal` is passed explicitly. Two standard fixes,
+  complementary: (1) a `--color=always|auto|never` flag (grep/git
+  convention) feeding the Console construction, so `--color=always |
+  less -R` works; (2) git-style auto-pager on a TTY — when output is
+  taller than the screen, spawn `$PAGER` with `LESS=-RFX` and force
+  colour into it (rich `console.pager(styles=True)` or a subprocess).
+  Interim workaround: `script -qec "agmon show <id>" /dev/null | less -R`
+  (fake pty). Surfaced 2026-07-15.
+- An auth-failed run is opaque in every list view: when claude can't see
+  credentials (here: `--bare` severed OAuth — next entry) it replies "Not
+  logged in · Please run /login", stamps the result `subtype:"success"`,
+  and exits 1. The wrapper's exit-code guard correctly lands status=error,
+  but issue_count stays 0 (`is_error` is false: subtype success and no
+  `is_error:true` — the mirror image of the documented lying-529 case,
+  minus even the flag), cost is $0.00, and the only clue is `result_text`
+  behind the summary endpoint. So `ls` shows an error run, zero issues,
+  zero cost, and you open the run to learn why. Enhancement candidate: a
+  derive-level issue (or status badge) for result-subtype-success +
+  nonzero exit — "stream says fine, process says no" is exactly the
+  divergence worth one glanceable line. Hit 2026-07-17 live-testing spec
+  007 (the run also proved a nice 007 property: even an unauthenticated
+  run emits an init event, so `model` still observes).
+- `agmon run --bare` silently severs subscription auth: claude 2.1.212's
+  `--bare` skips credential loading along with the hooks/skills/CLAUDE.md
+  discovery it's meant to skip — the identical `claude -p` over the same
+  ssh env answers fine without `--bare` and says "Not logged in" with it,
+  credentials file present and fresh. So every `--bare` dispatch on a
+  /login-authenticated box fails, and it fails in the opaque shape of the
+  previous entry (two runs burned before the flag was suspected; isolated
+  2026-07-17 by A/B-ing `claude -p` ±`--bare` directly). Candidates:
+  caveat on the `--bare` help text, a wrapper preflight (bare + no
+  ANTHROPIC_API_KEY → warn), or report it upstream — bare skipping
+  *identity* looks like a claude CLI bug, not a feature.
